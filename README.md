@@ -57,6 +57,7 @@ wsl -d Ubuntu -- bash /mnt/d/AI/claudecode-telegram-main/windows/start.sh
 **进入 WSL Ubuntu 终端：**
 ```powershell
 wsl -d Ubuntu
+tmux attach -t bridge 进入关闭bridge
 ```
 
 **查看/接管桥接服务器的终端窗口：**

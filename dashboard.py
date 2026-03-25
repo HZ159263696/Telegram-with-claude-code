@@ -1,0 +1,1006 @@
+#!/usr/bin/env python3
+"""Claude Bridge Dashboard — Visual control console at http://localhost:9999"""
+
+import os
+import sys
+import json
+import re
+import time
+import queue
+import threading
+import subprocess
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
+from pathlib import Path
+
+DASHBOARD_PORT   = int(os.environ.get("DASHBOARD_PORT", "8888"))
+BRIDGE_SCRIPT    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge.py")
+MODEL_FILE       = os.path.expanduser("~/.claude/telegram_model")
+TOKEN_STATS_FILE = os.path.expanduser("~/.claude/telegram_token_stats.json")
+PENDING_FILE     = os.path.expanduser("~/.claude/telegram_pending")
+API_KEYS_FILE    = os.path.expanduser("~/.claude/telegram_api_keys.json")
+LTLOG            = "/tmp/lt_bridge.log"
+CHAT_ID_FILE     = os.path.expanduser("~/.claude/telegram_chat_id")
+TMUX_SESSION     = os.environ.get("TMUX_SESSION", "claude")
+LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4000")
+ANTHROPIC_PROXY_URL = "http://localhost:4001"
+
+# Claude model provider detection
+_CLAUDE_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
+# Non-Claude models need CLI alias for LiteLLM routing
+_CLI_MODEL_ALIAS = {
+    "deepseek-chat":     "claude-3-5-sonnet-20241022",
+    "deepseek-reasoner": "claude-3-opus-20240229",
+    "glm-4-plus":        "claude-3-sonnet-20240229",
+    "glm-4-flash":       "claude-3-haiku-20240307",
+    "abab6.5s-chat":     "claude-3-5-haiku-20241022",
+    "qwen-max":          "claude-3-5-sonnet-latest",
+    "qwen-plus":         "claude-3-opus-latest",
+    "qwen-turbo":        "claude-3-haiku-20240307",
+}
+
+def _relaunch_claude(model):
+    """Relaunch Claude Code in tmux with the correct model/provider."""
+    def _do():
+        try:
+            subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION],
+                           capture_output=True, check=True)
+            # Exit current Claude Code instance
+            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Escape", ""])
+            time.sleep(0.2)
+            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "/exit", "Enter"])
+            time.sleep(1.5)  # Wait for exit + possible session death
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass  # Session doesn't exist, will create below
+
+        # Re-check: session may have died after /exit (tmux kills session when initial command exits)
+        result = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION],
+                               capture_output=True)
+        if result.returncode != 0:
+            subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION],
+                           capture_output=True)
+            time.sleep(0.5)
+
+        # Start with correct model
+        if model in _CLAUDE_MODELS:
+            cmd = f"claude --dangerously-skip-permissions --model {model}"
+        else:
+            cli_model = _CLI_MODEL_ALIAS.get(model, model)
+            cmd = f"ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL={ANTHROPIC_PROXY_URL} claude --dangerously-skip-permissions --model {cli_model}"
+        subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"])
+        _log(f"Claude Code relaunched with model: {model}")
+    threading.Thread(target=_do, daemon=True).start()
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+_bridge_proc       = None
+_bridge_start_time = None
+_log_buffer        = []
+_log_lock          = threading.Lock()
+_sse_queues        = []
+_sse_lock          = threading.Lock()
+MAX_LOG_LINES      = 500
+
+
+def _log(line):
+    ts    = time.strftime("%H:%M:%S")
+    entry = f"[{ts}] {line.rstrip()}"
+    with _log_lock:
+        _log_buffer.append(entry)
+        if len(_log_buffer) > MAX_LOG_LINES:
+            _log_buffer.pop(0)
+    with _sse_lock:
+        for q in list(_sse_queues):
+            try:
+                q.put_nowait(entry)
+            except queue.Full:
+                pass
+
+
+def _read_bridge_output(proc):
+    for raw in iter(proc.stdout.readline, b""):
+        _log(raw.decode(errors="replace"))
+
+
+def start_bridge():
+    global _bridge_proc, _bridge_start_time
+    if _bridge_proc and _bridge_proc.poll() is None:
+        return {"ok": False, "error": "Bridge already running"}
+    # Kill any stray bridge process (e.g. started by start.sh) before binding port
+    subprocess.call(["pkill", "-f", "bridge.py"], stderr=subprocess.DEVNULL)
+    bridge_port = int(os.environ.get("PORT", "9999"))
+    subprocess.call(["fuser", "-k", f"{bridge_port}/tcp"], stderr=subprocess.DEVNULL)
+    import time as _t; _t.sleep(0.5)  # wait for port to free
+    env = os.environ.copy()
+    _bridge_proc = subprocess.Popen(
+        [sys.executable, BRIDGE_SCRIPT],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=env, close_fds=True, bufsize=1,
+    )
+    _bridge_start_time = time.time()
+    threading.Thread(target=_read_bridge_output, args=(_bridge_proc,), daemon=True).start()
+    _log(f"Bridge started (PID {_bridge_proc.pid})")
+    return {"ok": True, "pid": _bridge_proc.pid}
+
+
+def stop_bridge():
+    global _bridge_proc, _bridge_start_time
+    if not _bridge_proc or _bridge_proc.poll() is not None:
+        return {"ok": False, "error": "Bridge not running"}
+    pid = _bridge_proc.pid
+    _bridge_proc.terminate()
+    try:
+        _bridge_proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _bridge_proc.kill()
+    _bridge_proc = None
+    _bridge_start_time = None
+    _log(f"Bridge stopped (PID {pid})")
+    return {"ok": True}
+
+
+def get_status():
+    running = _bridge_proc is not None and _bridge_proc.poll() is None
+    uptime  = int(time.time() - _bridge_start_time) if running and _bridge_start_time else 0
+    pid     = _bridge_proc.pid if running and _bridge_proc else None
+
+    model = "claude-sonnet-4-6"
+    if os.path.exists(MODEL_FILE):
+        try:
+            m = open(MODEL_FILE).read().strip()
+            if m:
+                model = m
+        except Exception:
+            pass
+
+    tokens = {"input": 0, "output": 0}
+    if os.path.exists(TOKEN_STATS_FILE):
+        try:
+            tokens = json.load(open(TOKEN_STATS_FILE))
+        except Exception:
+            pass
+
+    webhook = None
+    try:
+        content = open(LTLOG).read()
+        m = re.search(r'https://[^\s]+\.loca\.lt', content)
+        if m:
+            webhook = m.group(0)
+    except Exception:
+        pass
+
+    chat_id = None
+    if os.path.exists(CHAT_ID_FILE):
+        try:
+            chat_id = open(CHAT_ID_FILE).read().strip()
+        except Exception:
+            pass
+
+    return {
+        "running": running,
+        "pid":     pid,
+        "uptime":  uptime,
+        "model":   model,
+        "tokens":  tokens,
+        "webhook": webhook,
+        "chat_id": chat_id,
+    }
+
+
+def get_api_keys():
+    if os.path.exists(API_KEYS_FILE):
+        try:
+            return json.load(open(API_KEYS_FILE))
+        except Exception:
+            pass
+    return {}
+
+
+def save_api_keys(keys):
+    with open(API_KEYS_FILE, "w") as f:
+        json.dump(keys, f, indent=2)
+
+
+# ── HTML ──────────────────────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Claude Bridge 控制台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#080d18;
+  --surface:#0e1525;
+  --surface2:#141d30;
+  --border:#1e2d45;
+  --accent:#00d4ff;
+  --accent2:#0099bb;
+  --green:#00e676;
+  --red:#ff4444;
+  --text:#c8d8f0;
+  --text2:#5a7399;
+  --text3:#8faac8;
+  --font-mono:'JetBrains Mono',monospace;
+  --font-display:'Syne',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:var(--font-mono);
+  background:var(--bg);
+  min-height:100vh;
+  display:flex;flex-direction:column;align-items:center;
+  padding:24px 16px 40px;
+  color:var(--text);
+  position:relative;overflow-x:hidden;
+}
+
+/* ── Background grid ── */
+body::before{
+  content:'';position:fixed;inset:0;
+  background-image:
+    linear-gradient(rgba(0,212,255,.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,212,255,.025) 1px, transparent 1px);
+  background-size:40px 40px;
+  pointer-events:none;z-index:0;
+}
+body::after{
+  content:'';position:fixed;inset:0;
+  background:radial-gradient(ellipse 70% 50% at 50% 0%, rgba(0,212,255,.06) 0%, transparent 70%);
+  pointer-events:none;z-index:0;
+}
+*{position:relative;z-index:1}
+
+/* ── Header ── */
+.header{
+  display:flex;align-items:center;gap:12px;
+  margin-bottom:32px;width:100%;max-width:480px;
+}
+.header-dot{
+  width:8px;height:8px;border-radius:50%;
+  background:var(--accent);
+  box-shadow:0 0 10px var(--accent);
+  animation:blink 2s ease-in-out infinite;
+}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.header h1{
+  font-family:var(--font-display);
+  font-size:17px;font-weight:700;
+  color:#fff;letter-spacing:1.5px;text-transform:uppercase;
+  flex:1;
+}
+.header-ver{
+  font-size:10px;color:var(--text2);
+  border:1px solid var(--border);border-radius:4px;
+  padding:2px 7px;letter-spacing:.5px;
+}
+
+/* ── Power Button ── */
+.power-wrap{
+  display:flex;flex-direction:column;align-items:center;
+  margin-bottom:28px;
+}
+.power-ring{
+  width:156px;height:156px;border-radius:50%;
+  border:1px solid var(--border);
+  display:flex;align-items:center;justify-content:center;
+  position:relative;
+}
+.power-ring::before{
+  content:'';position:absolute;inset:-8px;border-radius:50%;
+  border:1px solid transparent;
+  background:linear-gradient(var(--bg),var(--bg)) padding-box,
+              linear-gradient(135deg,rgba(0,212,255,.2),transparent,rgba(0,212,255,.1)) border-box;
+}
+.power-btn{
+  width:120px;height:120px;border-radius:50%;border:none;cursor:pointer;
+  background:var(--surface2);
+  box-shadow:0 0 0 1px var(--border),inset 0 1px 0 rgba(255,255,255,.06);
+  display:flex;align-items:center;justify-content:center;
+  transition:all .25s ease;user-select:none;
+  position:relative;overflow:hidden;
+}
+.power-btn::before{
+  content:'';position:absolute;inset:0;border-radius:50%;
+  background:radial-gradient(circle at 40% 30%, rgba(255,255,255,.08), transparent 60%);
+}
+.power-icon{
+  width:44px;height:44px;
+  stroke:var(--text2);stroke-width:2;fill:none;
+  transition:stroke .3s;
+}
+.power-btn:hover .power-icon{stroke:var(--text)}
+.power-btn:active{transform:scale(.96)}
+.power-btn.running{
+  background:linear-gradient(135deg,#0d2a1a,#0a1f14);
+  box-shadow:0 0 0 1px rgba(0,230,118,.3),
+             0 0 30px rgba(0,230,118,.15),
+             inset 0 1px 0 rgba(255,255,255,.04);
+}
+.power-btn.running .power-icon{stroke:var(--green);filter:drop-shadow(0 0 6px rgba(0,230,118,.6))}
+.power-btn.running::after{
+  content:'';position:absolute;inset:-2px;border-radius:50%;
+  background:conic-gradient(var(--green) 0deg, transparent 60deg, transparent 300deg, var(--green) 360deg);
+  opacity:.15;animation:spin 4s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+.status-row{
+  margin-top:16px;display:flex;align-items:center;gap:8px;
+  font-size:12px;color:var(--text2);min-height:20px;
+}
+.status-dot{width:6px;height:6px;border-radius:50%;background:var(--red);flex-shrink:0}
+.status-dot.on{background:var(--green);box-shadow:0 0 8px var(--green)}
+.status-row.running{color:var(--green)}
+
+/* ── Model selector trigger ── */
+.model-trigger{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:12px;padding:12px 16px;
+  display:flex;align-items:center;gap:12px;cursor:pointer;
+  max-width:480px;width:100%;margin-bottom:16px;
+  transition:border-color .2s,background .2s;
+  user-select:none;
+}
+.model-trigger:hover{border-color:rgba(0,212,255,.3);background:var(--surface2)}
+.model-trigger-icon{font-size:20px;flex-shrink:0}
+.model-trigger-info{flex:1;min-width:0}
+.model-trigger-label{font-size:10px;color:var(--text2);margin-bottom:2px;letter-spacing:.5px;text-transform:uppercase}
+.model-trigger-name{font-size:14px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.model-trigger-prov{font-size:11px;color:var(--accent);margin-top:1px}
+.model-trigger-arrow{
+  font-size:16px;color:var(--text2);transition:transform .2s;flex-shrink:0;
+}
+.model-trigger.open .model-trigger-arrow{transform:rotate(180deg)}
+
+/* ── Stats cards ── */
+.cards{
+  display:grid;grid-template-columns:repeat(4,1fr);gap:8px;
+  max-width:480px;width:100%;margin-bottom:16px;
+}
+.card{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:10px;padding:11px 8px;text-align:center;
+  transition:border-color .2s;
+}
+.card:hover{border-color:rgba(0,212,255,.2)}
+.card-icon{font-size:17px;margin-bottom:5px;opacity:.8}
+.card-value{
+  font-size:12px;font-weight:600;color:#fff;
+  word-break:break-all;line-height:1.3;
+  font-family:var(--font-mono);
+}
+.card-label{font-size:9px;color:var(--text2);margin-top:3px;letter-spacing:.3px}
+
+/* ── Log panel ── */
+.log-panel{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:12px;padding:14px 16px;
+  max-width:480px;width:100%;margin-bottom:16px;
+}
+.log-header{
+  display:flex;justify-content:space-between;align-items:center;
+  margin-bottom:10px;
+}
+.log-title{
+  font-size:11px;font-weight:600;color:var(--text2);
+  letter-spacing:1px;text-transform:uppercase;display:flex;align-items:center;gap:7px;
+}
+.log-title-dot{width:5px;height:5px;border-radius:50%;background:var(--accent);box-shadow:0 0 6px var(--accent)}
+.log-btns{display:flex;gap:6px}
+.log-btn{
+  background:var(--surface2);border:1px solid var(--border);
+  border-radius:6px;color:var(--text3);font-size:10px;
+  padding:3px 9px;cursor:pointer;font-family:var(--font-mono);
+  transition:all .15s;
+}
+.log-btn:hover{border-color:rgba(0,212,255,.3);color:var(--accent)}
+#log-output{
+  height:180px;overflow-y:auto;
+  font-size:11px;line-height:1.6;
+  color:#4a6a90;
+  scrollbar-width:thin;scrollbar-color:var(--border) transparent;
+}
+#log-output .ll{padding:0;color:#4a6a90}
+#log-output .ll:nth-child(odd){color:#3d5a7a}
+#log-output .ll.new{color:var(--text3);animation:fadein .3s ease}
+@keyframes fadein{from{opacity:0;color:var(--accent)}to{opacity:1;color:var(--text3)}}
+
+/* ── Keys panel ── */
+details{max-width:480px;width:100%}
+summary{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:10px;padding:12px 16px;cursor:pointer;
+  font-size:11px;font-weight:600;color:var(--text2);
+  letter-spacing:1px;text-transform:uppercase;
+  list-style:none;display:flex;align-items:center;gap:8px;
+  transition:border-color .2s;
+}
+summary:hover{border-color:rgba(0,212,255,.2)}
+summary::-webkit-details-marker{display:none}
+details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparent}
+.keys-body{
+  background:var(--surface);border:1px solid var(--border);
+  border-top:none;border-radius:0 0 10px 10px;padding:16px;
+}
+.kr{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.kr label{font-size:11px;color:var(--text2);width:70px;flex-shrink:0;letter-spacing:.3px}
+.kr input{
+  flex:1;background:var(--bg);border:1px solid var(--border);border-radius:7px;
+  padding:7px 11px;font-size:11px;font-family:var(--font-mono);
+  color:var(--text);outline:none;transition:border-color .2s;
+}
+.kr input:focus{border-color:var(--accent)}
+.save-btn{
+  background:linear-gradient(135deg,var(--accent2),var(--accent));
+  color:#000;border:none;border-radius:8px;
+  padding:8px 22px;font-size:12px;font-weight:700;
+  font-family:var(--font-mono);cursor:pointer;margin-top:4px;
+  letter-spacing:.5px;transition:opacity .2s;
+}
+.save-btn:hover{opacity:.85}
+
+/* ── Model Picker Sheet ── */
+.sheet-overlay{
+  position:fixed;inset:0;background:rgba(0,0,0,.7);
+  z-index:100;opacity:0;pointer-events:none;transition:opacity .3s;
+  backdrop-filter:blur(4px);
+}
+.sheet-overlay.open{opacity:1;pointer-events:all}
+.sheet{
+  position:fixed;bottom:0;left:50%;transform:translateX(-50%) translateY(100%);
+  width:100%;max-width:520px;
+  background:var(--surface);
+  border:1px solid var(--border);border-bottom:none;
+  border-radius:20px 20px 0 0;
+  z-index:101;transition:transform .35s cubic-bezier(.32,1,.25,1);
+  max-height:82vh;display:flex;flex-direction:column;
+}
+.sheet.open{transform:translateX(-50%) translateY(0)}
+.sheet-handle{
+  width:36px;height:4px;border-radius:2px;
+  background:var(--border);margin:12px auto 0;flex-shrink:0;
+}
+.sheet-header{
+  padding:16px 20px 12px;flex-shrink:0;
+  border-bottom:1px solid var(--border);
+}
+.sheet-header-top{
+  display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;
+}
+.sheet-title{
+  font-family:var(--font-display);font-size:15px;font-weight:700;
+  color:#fff;letter-spacing:.5px;
+}
+.sheet-count{font-size:11px;color:var(--text2)}
+.sheet-subtitle{font-size:11px;color:var(--text2)}
+.sheet-close{
+  background:var(--surface2);border:1px solid var(--border);
+  border-radius:50%;width:28px;height:28px;cursor:pointer;
+  color:var(--text2);font-size:16px;line-height:28px;text-align:center;
+  transition:all .15s;
+}
+.sheet-close:hover{color:#fff;border-color:rgba(255,255,255,.2)}
+.sheet-body{overflow-y:auto;flex:1;padding:8px 0 20px;
+  scrollbar-width:thin;scrollbar-color:var(--border) transparent;}
+
+/* ── Provider group ── */
+.prov-group{margin-bottom:4px}
+.prov-label{
+  font-size:10px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;
+  padding:10px 20px 5px;font-weight:600;
+}
+/* ── Model row item ── */
+.model-item{
+  display:flex;align-items:center;gap:14px;
+  padding:13px 20px;cursor:pointer;
+  border-left:2px solid transparent;
+  transition:background .15s,border-color .15s;
+  position:relative;
+}
+.model-item:hover{background:rgba(0,212,255,.04)}
+.model-item.selected{
+  background:rgba(0,212,255,.06);
+  border-left-color:var(--accent);
+}
+.model-radio{
+  width:20px;height:20px;border-radius:50%;flex-shrink:0;
+  border:2px solid var(--border);
+  display:flex;align-items:center;justify-content:center;
+  transition:border-color .2s;
+}
+.model-item.selected .model-radio{
+  border-color:var(--accent);background:rgba(0,212,255,.15);
+}
+.model-radio-dot{
+  width:8px;height:8px;border-radius:50%;
+  background:var(--accent);
+  transform:scale(0);transition:transform .2s;
+  box-shadow:0 0 6px var(--accent);
+}
+.model-item.selected .model-radio-dot{transform:scale(1)}
+.model-icon{font-size:22px;flex-shrink:0;width:28px;text-align:center}
+.model-info{flex:1;min-width:0}
+.model-name{font-size:13px;font-weight:600;color:#fff}
+.model-item.selected .model-name{color:var(--accent)}
+.model-desc{font-size:10px;color:var(--text2);margin-top:1px}
+.model-badge{
+  font-size:10px;font-weight:600;
+  padding:3px 9px;border-radius:20px;flex-shrink:0;
+  font-family:var(--font-mono);letter-spacing:.3px;
+}
+.badge-fast{background:rgba(0,230,118,.12);color:var(--green);border:1px solid rgba(0,230,118,.2)}
+.badge-smart{background:rgba(0,212,255,.12);color:var(--accent);border:1px solid rgba(0,212,255,.2)}
+.badge-reason{background:rgba(255,180,0,.12);color:#ffb400;border:1px solid rgba(255,180,0,.2)}
+.badge-cheap{background:rgba(150,100,255,.12);color:#b080ff;border:1px solid rgba(150,100,255,.2)}
+.divider{height:1px;background:var(--border);margin:0 20px}
+
+/* ── Toast ── */
+.toast{
+  position:fixed;bottom:32px;left:50%;transform:translateX(-50%);
+  background:var(--surface2);border:1px solid var(--border);
+  color:var(--text);padding:10px 20px;border-radius:20px;
+  font-size:12px;opacity:0;transition:opacity .3s;
+  pointer-events:none;z-index:200;letter-spacing:.3px;
+  box-shadow:0 8px 30px rgba(0,0,0,.4);
+  white-space:nowrap;
+}
+.toast.show{opacity:1}
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-dot"></div>
+  <h1>Claude Bridge</h1>
+  <div class="header-ver">v2.0</div>
+</div>
+
+<!-- Power Button -->
+<div class="power-wrap">
+  <div class="power-ring">
+    <button class="power-btn" id="powerBtn" onclick="toggleBridge()">
+      <svg class="power-icon" viewBox="0 0 24 24">
+        <path d="M12 2v6M5.636 5.636A9 9 0 1018.364 18.364 9 9 0 005.636 5.636z"/>
+      </svg>
+    </button>
+  </div>
+  <div class="status-row" id="statusRow">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">加载中…</span>
+  </div>
+</div>
+
+<!-- Model Selector Trigger -->
+<div class="model-trigger" id="modelTrigger" onclick="openSheet()">
+  <div class="model-trigger-icon" id="triggerIcon">🤖</div>
+  <div class="model-trigger-info">
+    <div class="model-trigger-label">当前模型</div>
+    <div class="model-trigger-name" id="triggerName">Claude Sonnet 4.6</div>
+    <div class="model-trigger-prov" id="triggerProv">Anthropic</div>
+  </div>
+  <div class="model-trigger-arrow" id="triggerArrow">▾</div>
+</div>
+
+<!-- Stats Cards -->
+<div class="cards">
+  <div class="card">
+    <div class="card-icon">⬆</div>
+    <div class="card-value" id="cOut">0</div>
+    <div class="card-label">输出 Tokens</div>
+  </div>
+  <div class="card">
+    <div class="card-icon">⬇</div>
+    <div class="card-value" id="cIn">0</div>
+    <div class="card-label">输入 Tokens</div>
+  </div>
+  <div class="card">
+    <div class="card-icon">⏱</div>
+    <div class="card-value" id="cUp">—</div>
+    <div class="card-label">运行时长</div>
+  </div>
+  <div class="card">
+    <div class="card-icon">🔗</div>
+    <div class="card-value" id="cWH">—</div>
+    <div class="card-label">Webhook</div>
+  </div>
+</div>
+
+<!-- Log Panel -->
+<div class="log-panel">
+  <div class="log-header">
+    <div class="log-title">
+      <div class="log-title-dot"></div>
+      实时日志
+    </div>
+    <div class="log-btns">
+      <button class="log-btn" id="pauseBtn" onclick="togglePause()">⏸ 暂停</button>
+      <button class="log-btn" onclick="clearLog()">清空</button>
+    </div>
+  </div>
+  <div id="log-output"></div>
+</div>
+
+<!-- API Keys -->
+<details>
+  <summary>
+    <span style="font-size:14px">🔑</span>
+    API Keys 配置
+    <span style="margin-left:auto;font-size:13px;letter-spacing:0">▾</span>
+  </summary>
+  <div class="keys-body">
+    <div class="kr"><label>DeepSeek</label><input id="k-ds" type="password" placeholder="sk-..."></div>
+    <div class="kr"><label>智谱AI</label><input id="k-zp" type="password" placeholder="id.secret"></div>
+    <div class="kr"><label>MiniMax</label><input id="k-mm" type="password" placeholder="sk-api-..."></div>
+    <div class="kr"><label>百炼</label><input id="k-bl" type="password" placeholder="sk-..."></div>
+    <button class="save-btn" onclick="saveKeys()">保存 API Keys</button>
+  </div>
+</details>
+
+<!-- Model Picker Sheet -->
+<div class="sheet-overlay" id="sheetOverlay" onclick="closeSheet()"></div>
+<div class="sheet" id="sheet">
+  <div class="sheet-handle"></div>
+  <div class="sheet-header">
+    <div class="sheet-header-top">
+      <div class="sheet-title">选择模型</div>
+      <button class="sheet-close" onclick="closeSheet()">✕</button>
+    </div>
+    <div class="sheet-subtitle" id="sheetSub">共 10 个模型 · 已选：Claude Sonnet 4.6</div>
+  </div>
+  <div class="sheet-body" id="sheetBody"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const MODELS=[
+  {id:"claude-opus-4-6",  name:"Claude Opus 4.6",    prov:"Anthropic", icon:"🟣", desc:"最强推理，复杂任务首选",  badge:"smart",  badgeTxt:"SMART"},
+  {id:"claude-sonnet-4-6",name:"Claude Sonnet 4.6",  prov:"Anthropic", icon:"🔵", desc:"均衡性能，日常主力",      badge:"fast",   badgeTxt:"FAST"},
+  {id:"claude-haiku-4-5-20251001",name:"Claude Haiku 4.5",prov:"Anthropic",icon:"⚪",desc:"超快响应，轻量任务",   badge:"cheap",  badgeTxt:"LITE"},
+  {id:"deepseek-chat",    name:"DeepSeek V3",         prov:"DeepSeek",  icon:"🐋", desc:"代码 & 推理强项",        badge:"smart",  badgeTxt:"CODE"},
+  {id:"deepseek-reasoner",name:"DeepSeek R1",         prov:"DeepSeek",  icon:"🧠", desc:"Chain-of-thought 推理",  badge:"reason", badgeTxt:"THINK"},
+  {id:"glm-4-plus",       name:"GLM-4 Plus",          prov:"ZhipuAI",   icon:"🌸", desc:"智谱旗舰，中文优化",     badge:"smart",  badgeTxt:"SMART"},
+  {id:"glm-4-flash",      name:"GLM-4 Flash",         prov:"ZhipuAI",   icon:"⚡", desc:"闪电响应，低成本",       badge:"cheap",  badgeTxt:"FAST"},
+  {id:"abab6.5s-chat",    name:"MiniMax 6.5s",        prov:"MiniMax",   icon:"🎭", desc:"多模态，长上下文",        badge:"smart",  badgeTxt:"MULTI"},
+  {id:"qwen-max",         name:"通义千问 Max",         prov:"Bailian",   icon:"☁️", desc:"阿里旗舰模型",           badge:"smart",  badgeTxt:"SMART"},
+  {id:"qwen-plus",        name:"通义千问 Plus",        prov:"Bailian",   icon:"🌤", desc:"性价比之选",             badge:"cheap",  badgeTxt:"FAST"},
+];
+
+let paused=false,isRunning=false,curModel="claude-sonnet-4-6";
+
+// Build model sheet
+function buildSheet(){
+  const body=document.getElementById("sheetBody");
+  const provs=[...new Set(MODELS.map(m=>m.prov))];
+  body.innerHTML="";
+  provs.forEach((prov,pi)=>{
+    const grp=document.createElement("div");
+    grp.className="prov-group";
+    const lbl=document.createElement("div");
+    lbl.className="prov-label";lbl.textContent=prov;
+    grp.appendChild(lbl);
+    MODELS.filter(m=>m.prov===prov).forEach(m=>{
+      const row=document.createElement("div");
+      row.className="model-item"+(m.id===curModel?" selected":"");
+      row.dataset.id=m.id;
+      row.innerHTML=`
+        <div class="model-radio"><div class="model-radio-dot"></div></div>
+        <div class="model-icon">${m.icon}</div>
+        <div class="model-info">
+          <div class="model-name">${m.name}</div>
+          <div class="model-desc">${m.desc}</div>
+        </div>
+        <div class="model-badge badge-${m.badge}">${m.badgeTxt}</div>`;
+      row.onclick=()=>selectModel(m);
+      grp.appendChild(row);
+      const div=document.createElement("div");div.className="divider";grp.appendChild(div);
+    });
+    body.appendChild(grp);
+  });
+}
+
+function selectModel(m){
+  curModel=m.id;
+  switchModel(m.id,m);
+  document.querySelectorAll(".model-item").forEach(el=>{
+    el.classList.toggle("selected",el.dataset.id===m.id);
+  });
+  updateTrigger(m);
+  document.getElementById("sheetSub").textContent=`共 ${MODELS.length} 个模型 · 已选：${m.name}`;
+  setTimeout(closeSheet,320);
+}
+
+function updateTrigger(m){
+  document.getElementById("triggerIcon").textContent=m.icon;
+  document.getElementById("triggerName").textContent=m.name;
+  document.getElementById("triggerProv").textContent=m.prov;
+}
+
+function openSheet(){
+  buildSheet();
+  document.getElementById("sheetOverlay").classList.add("open");
+  document.getElementById("sheet").classList.add("open");
+  document.getElementById("modelTrigger").classList.add("open");
+  // scroll to selected
+  setTimeout(()=>{
+    const sel=document.querySelector(".model-item.selected");
+    if(sel)sel.scrollIntoView({block:"center",behavior:"smooth"});
+  },350);
+}
+function closeSheet(){
+  document.getElementById("sheetOverlay").classList.remove("open");
+  document.getElementById("sheet").classList.remove("open");
+  document.getElementById("modelTrigger").classList.remove("open");
+}
+
+function fmt(n){
+  if(n>=1e6)return(n/1e6).toFixed(1)+"M";
+  if(n>=1e3)return(n/1e3).toFixed(1)+"K";
+  return String(n);
+}
+
+function updateUI(s){
+  isRunning=s.running;
+  const btn=document.getElementById("powerBtn");
+  const txt=document.getElementById("statusText");
+  const dot=document.getElementById("statusDot");
+  const row=document.getElementById("statusRow");
+  if(isRunning){
+    btn.classList.add("running");
+    dot.classList.add("on");
+    const u=s.uptime||0;
+    const h=Math.floor(u/3600),m=Math.floor((u%3600)/60),sec=u%60;
+    const up=h>0?`${h}h ${m}m`:m>0?`${m}m ${sec}s`:`${sec}s`;
+    txt.textContent=`运行中  PID ${s.pid}  ${up}`;
+    row.className="status-row running";
+    document.getElementById("cUp").textContent=up;
+  }else{
+    btn.classList.remove("running");
+    dot.classList.remove("on");
+    txt.textContent="已停止 — 点击启动";
+    row.className="status-row";
+    document.getElementById("cUp").textContent="—";
+  }
+  if(s.model&&s.model!==curModel){
+    curModel=s.model;
+    const m=MODELS.find(x=>x.id===curModel);
+    if(m)updateTrigger(m);
+  }
+  document.getElementById("cOut").textContent=fmt(s.tokens?.output||0);
+  document.getElementById("cIn").textContent=fmt(s.tokens?.input||0);
+  const wh=s.webhook;
+  const whEl=document.getElementById("cWH");
+  if(wh){whEl.textContent=wh.replace("https://","").slice(0,14)+"…";whEl.title=wh;}
+  else whEl.textContent="未连接";
+  // update sheet subtitle
+  const m=MODELS.find(x=>x.id===curModel);
+  document.getElementById("sheetSub").textContent=`共 ${MODELS.length} 个模型 · 已选：${m?m.name:curModel}`;
+}
+
+async function fetchStatus(){
+  try{const r=await fetch("/api/status");updateUI(await r.json());}catch(e){}
+}
+async function toggleBridge(){
+  const action=isRunning?"stop":"start";
+  try{
+    const r=await fetch("/api/bridge/"+action,{method:"POST"});
+    const d=await r.json();
+    toast(d.ok?(action==="start"?"Bridge 已启动":"Bridge 已停止"):"操作失败: "+d.error);
+    setTimeout(fetchStatus,600);
+  }catch(e){toast("请求失败");}
+}
+async function switchModel(model,m){
+  try{
+    const r=await fetch("/api/model",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model})});
+    const d=await r.json();
+    toast(d.ok?"已切换：" +(m?m.name:model):"切换失败: "+d.error);
+    fetchStatus();
+  }catch(e){toast("请求失败");}
+}
+async function saveKeys(){
+  const keys={
+    deepseek:document.getElementById("k-ds").value,
+    zhipu:document.getElementById("k-zp").value,
+    minimax:document.getElementById("k-mm").value,
+    bailian:document.getElementById("k-bl").value,
+  };
+  try{
+    const r=await fetch("/api/keys",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(keys)});
+    const d=await r.json();toast(d.ok?"API Keys 已保存 ✓":"保存失败");
+  }catch(e){toast("请求失败");}
+}
+async function loadKeys(){
+  try{
+    const d=await (await fetch("/api/keys")).json();
+    if(d.deepseek)document.getElementById("k-ds").value=d.deepseek;
+    if(d.zhipu)   document.getElementById("k-zp").value=d.zhipu;
+    if(d.minimax) document.getElementById("k-mm").value=d.minimax;
+    if(d.bailian) document.getElementById("k-bl").value=d.bailian;
+  }catch(e){}
+}
+function startSSE(){
+  const logEl=document.getElementById("log-output");
+  const es=new EventSource("/api/logs");
+  let first=true;
+  es.onmessage=(e)=>{
+    if(paused)return;
+    const div=document.createElement("div");
+    div.className="ll"+(first?"":" new");first=false;
+    div.textContent=e.data;
+    logEl.appendChild(div);
+    while(logEl.children.length>300)logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop=logEl.scrollHeight;
+  };
+  es.onerror=()=>setTimeout(startSSE,3000);
+}
+function togglePause(){
+  paused=!paused;
+  document.getElementById("pauseBtn").textContent=paused?"▶ 继续":"⏸ 暂停";
+}
+function clearLog(){document.getElementById("log-output").innerHTML="";}
+function toast(msg){
+  const t=document.getElementById("toast");
+  t.textContent=msg;t.classList.add("show");
+  setTimeout(()=>t.classList.remove("show"),2500);
+}
+
+// Init
+const initM=MODELS.find(x=>x.id===curModel);
+if(initM)updateTrigger(initM);
+fetchStatus();loadKeys();startSSE();
+setInterval(fetchStatus,3000);
+</script>
+</body>
+</html>"""
+
+
+# ── HTTP Handler ──────────────────────────────────────────────────────────────
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = urlparse(self.path).path
+
+        if path in ("/", "/index.html"):
+            self._html(HTML)
+
+        elif path == "/api/status":
+            self._json(get_status())
+
+        elif path == "/api/logs":
+            self._sse_stream()
+
+        elif path == "/api/keys":
+            self._json(get_api_keys())
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        path   = urlparse(self.path).path
+        length = int(self.headers.get("Content-Length", 0))
+        body   = self.rfile.read(length)
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+
+        if path == "/api/bridge/start":
+            self._json(start_bridge())
+
+        elif path == "/api/bridge/stop":
+            self._json(stop_bridge())
+
+        elif path == "/api/model":
+            model = data.get("model", "")
+            if not model:
+                self._json({"ok": False, "error": "no model"})
+                return
+            try:
+                with open(MODEL_FILE, "w") as f:
+                    f.write(model)
+                _relaunch_claude(model)
+                self._json({"ok": True, "model": model})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+
+        elif path == "/api/keys":
+            try:
+                save_api_keys(data)
+                self._json({"ok": True})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _html(self, html):
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _sse_stream(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        q = queue.Queue(maxsize=200)
+        # Flush last 50 buffered lines first
+        with _log_lock:
+            lines = list(_log_buffer[-50:])
+        for line in lines:
+            try:
+                self.wfile.write(f"data: {line}\n\n".encode())
+            except Exception:
+                return
+        try:
+            self.wfile.flush()
+        except Exception:
+            return
+
+        with _sse_lock:
+            _sse_queues.append(q)
+
+        try:
+            while True:
+                try:
+                    line = q.get(timeout=15)
+                    self.wfile.write(f"data: {line}\n\n".encode())
+                    self.wfile.flush()
+                except queue.Empty:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+        except Exception:
+            pass
+        finally:
+            with _sse_lock:
+                try:
+                    _sse_queues.remove(q)
+                except ValueError:
+                    pass
+
+    def log_message(self, *args):
+        pass
+
+
+class ThreadingDashboard(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    if not os.environ.get("TELEGRAM_BOT_TOKEN"):
+        print("⚠  TELEGRAM_BOT_TOKEN not set — bridge won't start without it")
+    else:
+        start_bridge()  # auto-start bridge on dashboard launch
+    print(f"Dashboard → http://localhost:{DASHBOARD_PORT}")
+    print(f"Bridge script: {BRIDGE_SCRIPT}")
+    try:
+        ThreadingDashboard(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever()
+    except KeyboardInterrupt:
+        stop_bridge()
+        print("\nStopped")
+
+
+if __name__ == "__main__":
+    main()
