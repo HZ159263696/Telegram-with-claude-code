@@ -35,24 +35,23 @@ PORT = int(os.environ.get("PORT", "9999"))
 BOT_PROFILES = {
     "/": {
         "name":          "主控Bot",
-        "token":         "",            # 运行时填充
-        "system_prompt": None,          # 走全局 CLAUDE.md
-        "direct_api":    False,         # 走 tmux → Claude Code
-        "model":         None,          # 跟随用户 /model 设置
+        "token":         "",
+        "direct_api":    False,
+        "tmux_session":  "claude",              # Claude Code 实例1
+        "pending_file":  os.path.expanduser("~/.claude/telegram_pending"),
+        "chat_id_file":  os.path.expanduser("~/.claude/telegram_chat_id"),
+        "model_file":    os.path.expanduser("~/.claude/telegram_model"),
+        "work_dir":      None,                  # 不指定工作目录
     },
     "/stock": {
         "name":          "股票Bot",
-        "token":         "",            # 运行时填充
-        "direct_api":    True,          # 独立对话，不走 tmux，完全隔离
-        "model":         "deepseek-v4-pro",   # 默认用 DeepSeek，快且免费
-        "system_prompt": (
-            "你是专业A股量化投资分析师，具备深厚的技术分析、基本面分析和量化策略能力。\n"
-            "【数据获取】优先用 akshare 库拉取实时/历史数据，不要捏造数据。\n"
-            "【分析必含】K线走势、MACD、RSI14、KDJ、成交量、均线(MA5/10/20/60)、布林带。\n"
-            "【操作建议】必须给出明确结论：买入 / 持有 / 减仓 / 卖出，并注明关键支撑位和压力位。\n"
-            "【语言】始终用中文回复，数字保留2位小数。\n"
-            "【态度】直接给结论，不要废话。"
-        ),
+        "token":         "",
+        "direct_api":    False,
+        "tmux_session":  "claude_stock",        # Claude Code 实例2（独立）
+        "pending_file":  os.path.expanduser("~/.claude/telegram_pending_stock"),
+        "chat_id_file":  os.path.expanduser("~/.claude/telegram_chat_id_stock"),
+        "model_file":    os.path.expanduser("~/.claude/telegram_model_stock"),
+        "work_dir":      "/mnt/d/cao_stock",    # 股票工作区
     },
 }
 WECHAT_SEND_FILE = "/tmp/wechat_send.json"
@@ -130,17 +129,19 @@ def get_cli_model(model):
     return CLI_MODEL_ALIAS.get(model, model)
 
 
-def get_model():
-    if os.path.exists(MODEL_FILE):
-        m = open(MODEL_FILE).read().strip()
+def get_model(model_file=None):
+    f = model_file or MODEL_FILE
+    if os.path.exists(f):
+        m = open(f).read().strip()
         if m:
             return m
     return None
 
 
-def set_model(model):
-    with open(MODEL_FILE, "w") as f:
-        f.write(model)
+def set_model(model, model_file=None):
+    f = model_file or MODEL_FILE
+    with open(f, "w") as fp:
+        fp.write(model)
 
 
 def model_flag():
@@ -354,29 +355,44 @@ def send_typing_loop(chat_id, token=None):
         time.sleep(4)
 
 
-def tmux_exists():
-    return subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION], capture_output=True).returncode == 0
+def tmux_exists(session=None):
+    # 精确匹配，避免 tmux has-session 的前缀匹配把 "claude" 误判为存在
+    # （当只有 "claude_stock" 时，has-session -t claude 也会返回 0）
+    s = session or TMUX_SESSION
+    r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return False
+    return s in r.stdout.split()
 
 
-def tmux_send(text, literal=True):
-    cmd = ["tmux", "send-keys", "-t", TMUX_SESSION]
+def tmux_send(text, literal=True, session=None):
+    s = session or TMUX_SESSION
+    if not tmux_exists(s):
+        return
+    cmd = ["tmux", "send-keys", "-t", s]
     if literal:
         cmd.append("-l")
     cmd.append(text)
     subprocess.run(cmd)
 
 
-def tmux_send_enter():
-    subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"])
+def tmux_send_enter(session=None):
+    s = session or TMUX_SESSION
+    if not tmux_exists(s):
+        return
+    subprocess.run(["tmux", "send-keys", "-t", s, "Enter"])
 
 
-def tmux_send_with_enter(text):
+def tmux_send_with_enter(text, session=None):
     """Send text + Enter reliably using tmux buffer paste."""
-    # Use load-buffer + paste-buffer to handle spaces and special chars
+    s = session or TMUX_SESSION
+    if not tmux_exists(s):
+        return
     subprocess.run(["tmux", "load-buffer", "-"], input=text.encode())
-    subprocess.run(["tmux", "paste-buffer", "-t", TMUX_SESSION])
+    subprocess.run(["tmux", "paste-buffer", "-t", s])
     time.sleep(0.3)
-    subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"])
+    subprocess.run(["tmux", "send-keys", "-t", s, "Enter"])
 
 
 CLAUDE_JSON_PATH = os.path.expanduser("~/.claude.json")
@@ -410,8 +426,11 @@ def _approve_custom_key(api_key):
             pass
 
 
-def tmux_send_escape():
-    subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Escape"])
+def tmux_send_escape(session=None):
+    s = session or TMUX_SESSION
+    if not tmux_exists(s):
+        return
+    subprocess.run(["tmux", "send-keys", "-t", s, "Escape"])
 
 
 def get_recent_sessions(limit=5):
@@ -479,11 +498,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if data.startswith("model:"):
             chosen = data.split(":", 1)[1]
-            set_model(chosen)
+            set_model(chosen, self.profile.get("model_file"))
             label    = next((l for m, l, *_ in MODELS if m == chosen), chosen)
             provider = get_provider(chosen)
             self._relaunch_claude_for_model(chat_id, chosen, provider)
-            self.reply(chat_id, f"已切换到 {label}")
+            self.reply(chat_id, f"[{self.profile['name']}] 已切换到 {label}")
             return
 
         # Commands below require tmux
@@ -617,35 +636,38 @@ class Handler(BaseHTTPRequestHandler):
             cmd = text.split()[0].lower()
 
             if cmd == "/status":
-                cur_model = get_model() or "claude-opus-4-7"
+                cur_model = get_model(self.profile.get("model_file")) or "claude-opus-4-7"
                 cur_label = next((l for m, l, *_ in MODELS if m == cur_model), cur_model)
                 cur_provider = get_provider(cur_model)
-                tmux_status = "running" if tmux_exists() else "not found"
+                sess = self.profile.get("tmux_session", TMUX_SESSION)
+                tmux_status = "running" if tmux_exists(sess) else "not found"
                 lines = [
+                    f"[{self.profile['name']}]",
                     f"模型: {cur_label}",
                     f"Provider: {cur_provider}",
-                    f"tmux '{TMUX_SESSION}': {tmux_status}",
+                    f"tmux '{sess}': {tmux_status}",
                 ]
                 self.reply(chat_id, "\n".join(lines))
                 return
 
             if cmd == "/stop":
-                if tmux_exists():
-                    tmux_send_escape()
-                if os.path.exists(PENDING_FILE):
-                    os.remove(PENDING_FILE)
+                sess  = self.profile.get("tmux_session", TMUX_SESSION)
+                pfile = self.profile.get("pending_file", PENDING_FILE)
+                if tmux_exists(sess):
+                    tmux_send_escape(sess)
+                if os.path.exists(pfile):
+                    os.remove(pfile)
                 self.reply(chat_id, "Interrupted")
                 return
 
             if cmd == "/clear":
-                bot_path = self.path.split("?")[0].rstrip("/") or "/"
-                hist_key = f"{bot_path}:{chat_id}"
-                _conv_history.pop(hist_key, None)
-                if not self.profile.get("direct_api") and tmux_exists():
-                    tmux_send_escape()
+                sess  = self.profile.get("tmux_session", TMUX_SESSION)
+                pfile = self.profile.get("pending_file", PENDING_FILE)
+                if tmux_exists(sess):
+                    tmux_send_escape(sess)
                     time.sleep(0.2)
-                    tmux_send("/clear")
-                    tmux_send_enter()
+                    tmux_send("/clear", session=sess)
+                    tmux_send_enter(sess)
                 self.reply(chat_id, "Cleared")
                 return
 
@@ -738,11 +760,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if cmd == "/model":
-                current = get_model() or "claude-opus-4-7"
+                current = get_model(self.profile.get("model_file")) or "claude-opus-4-7"
                 kb = [[{"text": f"{'✓ ' if current == m else ''}{label}", "callback_data": f"model:{m}"}] for m, label, *_ in MODELS]
                 telegram_api("sendMessage", {
                     "chat_id": chat_id,
-                    "text": f"当前模型：{current}\n选择新模型：",
+                    "text": f"[{self.profile['name']}] 当前模型：{current}\n选择新模型：",
                     "reply_markup": {"inline_keyboard": kb}
                 }, token=self.bot_token)
                 return
@@ -772,40 +794,35 @@ class Handler(BaseHTTPRequestHandler):
         bot_path = self.path.split("?")[0].rstrip("/") or "/"
         print(f"[{self.profile['name']}][{chat_id}] {text[:50]}...")
 
-        # ── direct_api bots: fully isolated conversation, never touch tmux ──
-        if self.profile.get("direct_api"):
-            model    = self.profile.get("model") or get_model() or "deepseek-v4-pro"
-            provider = get_provider(model)
-            threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token), daemon=True).start()
-            threading.Thread(
-                target=self._call_api_and_reply,
-                args=(chat_id, text, model, provider, bot_path),
-                daemon=True,
-            ).start()
-            return
+        # ── tmux bots: route through Claude Code CLI (per-bot session) ──
+        tmux_sess    = self.profile.get("tmux_session", TMUX_SESSION)
+        pending_file = self.profile.get("pending_file", PENDING_FILE)
+        chat_id_file = self.profile.get("chat_id_file", CHAT_ID_FILE)
+        model        = get_model(self.profile.get("model_file")) or "claude-opus-4-7"
+        provider     = get_provider(model)
 
-        # ── tmux bots: route through Claude Code CLI ──
-        model    = get_model() or "claude-opus-4-7"
-        provider = get_provider(model)
+        # Write chat_id for this bot's hook to pick up
+        with open(chat_id_file, "w") as f:
+            f.write(str(chat_id))
 
-        # Busy-guard: if Claude is still processing previous message, reject to avoid tmux queue pile-up
-        if os.path.exists(PENDING_FILE):
+        # Busy-guard: per-bot pending file
+        if os.path.exists(pending_file):
             try:
-                pt = int(open(PENDING_FILE).read().strip())
+                pt = int(open(pending_file).read().strip())
                 if time.time() - pt < 600:
                     self.reply(chat_id, "⏳ Claude 还在处理上一条消息，请稍候再发（如要中断用 /stop）")
                     return
             except:
-                try: os.remove(PENDING_FILE)
+                try: os.remove(pending_file)
                 except: pass
 
-        with open(PENDING_FILE, "w") as f:
+        with open(pending_file, "w") as f:
             f.write(str(int(time.time())))
 
         threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token), daemon=True).start()
 
-        if tmux_exists():
-            tmux_send_with_enter(text)
+        if tmux_exists(tmux_sess):
+            tmux_send_with_enter(text, session=tmux_sess)
         elif provider != "claude":
             threading.Thread(
                 target=self._call_api_and_reply,
@@ -813,9 +830,9 @@ class Handler(BaseHTTPRequestHandler):
                 daemon=True,
             ).start()
         else:
-            self.reply(chat_id, "tmux not found, 请先用 /relaunch 启动 Claude Code")
-            if os.path.exists(PENDING_FILE):
-                os.remove(PENDING_FILE)
+            self.reply(chat_id, f"tmux session '{tmux_sess}' not found, 请先启动")
+            if os.path.exists(pending_file):
+                os.remove(pending_file)
 
     def _call_api_and_reply(self, chat_id, text, model, provider, bot_path="/"):
         hist_key = f"{bot_path}:{chat_id}"
@@ -869,34 +886,43 @@ class Handler(BaseHTTPRequestHandler):
         tmux_send_with_enter(prompt)
 
     def _relaunch_claude_for_model(self, chat_id, model, provider):
-        """Exit current Claude CLI and relaunch with the new model. Creates tmux session if needed."""
+        """Exit and relaunch THIS bot's Claude session with the new model.
+        Only touches the session/pending file/work_dir bound to self.profile —
+        the other bot's session is untouched."""
+        sess         = self.profile.get("tmux_session", TMUX_SESSION)
+        pending_file = self.profile.get("pending_file", PENDING_FILE)
+        work_dir     = self.profile.get("work_dir")
+
         # 清残留 PENDING，否则切完模型再发消息会被 busy-guard 挡住
-        if os.path.exists(PENDING_FILE):
-            try: os.remove(PENDING_FILE)
+        if os.path.exists(pending_file):
+            try: os.remove(pending_file)
             except: pass
 
-        if tmux_exists():
+        if tmux_exists(sess):
             # Escape 退出 Claude UI，C-c 中断任何 shell 前台进程
-            tmux_send_escape()
+            tmux_send_escape(sess)
             time.sleep(0.2)
-            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-c"])
+            subprocess.run(["tmux", "send-keys", "-t", sess, "C-c"])
             time.sleep(0.3)
-            tmux_send("/exit")
-            tmux_send_enter()
+            tmux_send("/exit", session=sess)
+            tmux_send_enter(sess)
             time.sleep(1.5)
             # 清掉 shell 当前行（防止历史里残留的 claude --resume 被错误回车）
-            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-c"])
+            subprocess.run(["tmux", "send-keys", "-t", sess, "C-c"])
             time.sleep(0.1)
-            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-u"])
+            subprocess.run(["tmux", "send-keys", "-t", sess, "C-u"])
             time.sleep(0.2)
 
         # Re-check: session may have died after /exit (tmux kills session when initial command exits)
-        if not tmux_exists():
-            subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION], capture_output=True)
+        if not tmux_exists(sess):
+            new_args = ["tmux", "new-session", "-d", "-s", sess]
+            if work_dir:
+                new_args += ["-c", work_dir]
+            subprocess.run(new_args, capture_output=True)
             time.sleep(0.5)
 
         # 用 paste-buffer 送启动命令；claude_launch_cmd 已预写 approved key，不会弹确认
-        tmux_send_with_enter(claude_launch_cmd(model))
+        tmux_send_with_enter(claude_launch_cmd(model), session=sess)
 
     # ── 自然语言股票快捷指令 ──────────────────────────────────────────────
 
@@ -1331,11 +1357,11 @@ class Handler(BaseHTTPRequestHandler):
     def _do_relaunch(self, chat_id):
         """Kill current Claude Code process in tmux and start a fresh one."""
         time.sleep(0.3)
-        cur_model = get_model() or "claude-opus-4-7"
+        cur_model = get_model(self.profile.get("model_file")) or "claude-opus-4-7"
         cur_provider = get_provider(cur_model)
         self._relaunch_claude_for_model(chat_id, cur_model, cur_provider)
         time.sleep(2)
-        telegram_api("sendMessage", {"chat_id": chat_id, "text": "Claude Code relaunched ✓"})
+        telegram_api("sendMessage", {"chat_id": chat_id, "text": f"[{self.profile['name']}] Claude Code relaunched ✓"}, token=self.bot_token)
 
     def _do_restart(self):
         time.sleep(0.3)

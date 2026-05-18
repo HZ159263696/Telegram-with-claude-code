@@ -52,7 +52,7 @@ if [ -n "$TMUX" ]; then
 
     # 1. Start Claude Code in a separate tmux session named 'claude'
     #    bridge.py looks for session 'claude' via: tmux has-session -t claude
-    echo "[1] Starting tmux session 'claude'..."
+    echo "[1] Starting tmux session 'claude' (主控Bot)..."
     tmux kill-session -t claude 2>/dev/null || true
 
     # Read saved model preference (default: claude-opus-4-7)
@@ -87,6 +87,19 @@ if [ -n "$TMUX" ]; then
         tmux new-session -d -s claude "ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL=http://localhost:4001 claude --dangerously-skip-permissions --model $CLI_MODEL"
     fi
     echo "    tmux session 'claude' started (model: $SAVED_MODEL)."
+
+    # 1.5 Start stock Claude Code session (独立股票工作区)
+    echo "[1.5] Starting tmux session 'claude_stock' (股票Bot)..."
+    tmux kill-session -t claude_stock 2>/dev/null || true
+    STOCK_MODEL_FILE="$HOME/.claude/telegram_model_stock"
+    STOCK_MODEL="claude-sonnet-4-6"
+    if [ -f "$STOCK_MODEL_FILE" ]; then
+        STOCK_MODEL=$(cat "$STOCK_MODEL_FILE" | tr -d '[:space:]')
+        [ -z "$STOCK_MODEL" ] && STOCK_MODEL="claude-sonnet-4-6"
+    fi
+    tmux new-session -d -s claude_stock -c /mnt/d/cao_stock \
+        "claude --dangerously-skip-permissions --model $STOCK_MODEL"
+    echo "    tmux session 'claude_stock' started in /mnt/d/cao_stock (model: $STOCK_MODEL)"
 
     # 2. Start ngrok tunnel with auto-reconnect / 启动 ngrok 隧道（自动重连）
     # 用 ngrok 而不是 cloudflared/localtunnel: Telegram DNS 对 trycloudflare/loca.lt 不稳定，会拒绝解析

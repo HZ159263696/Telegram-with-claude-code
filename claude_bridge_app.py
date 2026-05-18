@@ -319,6 +319,7 @@ class MainWindow(QMainWindow):
                 [
                     "wsl", "-d", WSL_DISTRO, "--", "bash", "-c",
                     "pkill -f dashboard.py; pkill -f bridge.py; pkill -f litellm; "
+                    "pkill -f feishu_bridge.py; "
                     "tmux kill-session -t claude 2>/dev/null; tmux kill-session -t bridge 2>/dev/null; "
                     "tmux kill-session -t tunnel 2>/dev/null"
                 ],

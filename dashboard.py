@@ -26,6 +26,33 @@ TMUX_SESSION     = os.environ.get("TMUX_SESSION", "claude")
 LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4000")
 ANTHROPIC_PROXY_URL = "http://localhost:4001"
 
+# ── 多Bot配置 ──────────────────────────────────────────────────────────────────
+# 与 bridge.py 的 BOT_PROFILES 保持一致
+BOTS = {
+    "main": {
+        "name":         "主控Bot",
+        "tmux_session": "claude",
+        "model_file":   os.path.expanduser("~/.claude/telegram_model"),
+        "pending_file": os.path.expanduser("~/.claude/telegram_pending"),
+        "chat_id_file":os.path.expanduser("~/.claude/telegram_chat_id"),
+        "work_dir":     None,
+        "default_model":"claude-opus-4-7",
+    },
+    "stock": {
+        "name":         "股票Bot",
+        "tmux_session": "claude_stock",
+        "model_file":   os.path.expanduser("~/.claude/telegram_model_stock"),
+        "pending_file": os.path.expanduser("~/.claude/telegram_pending_stock"),
+        "chat_id_file":os.path.expanduser("~/.claude/telegram_chat_id_stock"),
+        "work_dir":     "/mnt/d/cao_stock",
+        "default_model":"claude-sonnet-4-6",
+    },
+}
+
+
+def _bot_or_default(key):
+    return BOTS.get(key, BOTS["main"])
+
 # Claude model provider detection
 _CLAUDE_MODELS = {"claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
 # Non-Claude models need CLI alias for LiteLLM routing
@@ -95,26 +122,36 @@ def _approve_custom_key(api_key):
             pass
 
 
-def _relaunch_claude(model):
-    """Relaunch Claude Code in tmux with the correct model/provider."""
+def _tmux_session_exists(session):
+    """Exact-match has-session check (避免 tmux 前缀匹配把 'claude' 误判到 'claude_stock')。"""
+    r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return False
+    return session in r.stdout.split()
+
+
+def _relaunch_claude(model, bot_key="main"):
+    """Relaunch Claude Code in the bot's tmux session with the correct model/provider."""
+    profile = _bot_or_default(bot_key)
+    sess     = profile["tmux_session"]
+    work_dir = profile.get("work_dir")
+    name     = profile["name"]
+
     def _do():
-        try:
-            subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION],
-                           capture_output=True, check=True)
+        if _tmux_session_exists(sess):
             # Exit current Claude Code instance
-            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Escape", ""])
+            subprocess.run(["tmux", "send-keys", "-t", sess, "Escape", ""])
             time.sleep(0.2)
-            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "/exit", "Enter"])
+            subprocess.run(["tmux", "send-keys", "-t", sess, "/exit", "Enter"])
             time.sleep(1.5)  # Wait for exit + possible session death
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass  # Session doesn't exist, will create below
 
         # Re-check: session may have died after /exit (tmux kills session when initial command exits)
-        result = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION],
-                               capture_output=True)
-        if result.returncode != 0:
-            subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION],
-                           capture_output=True)
+        if not _tmux_session_exists(sess):
+            new_args = ["tmux", "new-session", "-d", "-s", sess]
+            if work_dir:
+                new_args += ["-c", work_dir]
+            subprocess.run(new_args, capture_output=True)
             time.sleep(0.5)
 
         # Start with correct model
@@ -130,48 +167,68 @@ def _relaunch_claude(model):
             _approve_custom_key("sk-placeholder")
             cli_model = _CLI_MODEL_ALIAS.get(model, model)
             cmd = f"ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL={ANTHROPIC_PROXY_URL} claude --dangerously-skip-permissions --model {cli_model}"
-        subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"])
-        _log(f"Claude Code relaunched with model: {model}")
+        subprocess.run(["tmux", "send-keys", "-t", sess, cmd, "Enter"])
+        _log(f"[{name}] Claude Code relaunched with model: {model}", bot_key=bot_key)
     threading.Thread(target=_do, daemon=True).start()
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 _bridge_proc       = None
 _bridge_start_time = None
-_log_buffer        = []   # list of (seq, text)
-_log_seq           = 0    # monotonic counter
-_log_lock          = threading.Lock()
-_sse_queues        = []
-_sse_lock          = threading.Lock()
-MAX_LOG_LINES      = 500
+# 每个 Bot 独立的缓冲、序号、SSE 队列
+_log_buffers = {k: [] for k in BOTS}    # bot_key -> list of (seq, text)
+_log_seqs    = {k: 0  for k in BOTS}
+_log_lock    = threading.Lock()
+_sse_queues  = {k: [] for k in BOTS}    # bot_key -> list of queue.Queue
+_sse_lock    = threading.Lock()
+MAX_LOG_LINES = 500
 
 
-def _log(line):
-    global _log_seq
-    ts    = time.strftime("%H:%M:%S")
-    text  = f"[{ts}] {line.rstrip()}"
+def _push_log(bot_key, text):
+    """把一条已加好时间戳/前缀的日志写入指定 Bot 的缓冲和 SSE。"""
+    if bot_key not in BOTS:
+        return
     with _log_lock:
-        _log_seq += 1
-        entry = (_log_seq, text)
-        _log_buffer.append(entry)
-        if len(_log_buffer) > MAX_LOG_LINES:
-            _log_buffer.pop(0)
+        _log_seqs[bot_key] += 1
+        _log_buffers[bot_key].append((_log_seqs[bot_key], text))
+        if len(_log_buffers[bot_key]) > MAX_LOG_LINES:
+            _log_buffers[bot_key].pop(0)
     with _sse_lock:
-        for q in list(_sse_queues):
+        for q in list(_sse_queues[bot_key]):
             try:
                 q.put_nowait(text)
             except queue.Full:
                 pass
 
 
+def _log(line, bot_key=None):
+    """加时间戳的普通日志。bot_key=None 时广播到所有 Bot（用于 bridge 全局日志）。"""
+    ts   = time.strftime("%H:%M:%S")
+    text = f"[{ts}] {line.rstrip()}"
+    targets = [bot_key] if bot_key else list(BOTS.keys())
+    for k in targets:
+        _push_log(k, text)
+
+
 def _read_bridge_output(proc):
+    """Bridge 子进程的 stdout 同时给两个 Bot 看 — 因为 webhook 路由日志、错误等都是全局的。
+    但单条 `[主控Bot][...]` / `[股票Bot][...]` 行会被路由到对应 Bot。"""
     for raw in iter(proc.stdout.readline, b""):
-        _log(raw.decode(errors="replace"))
+        line = raw.decode(errors="replace").rstrip()
+        if not line:
+            continue
+        # bridge.py 打印 "[主控Bot][chat_id] ..." 这种行，根据前缀路由
+        target = None
+        if line.startswith("[主控Bot]"):
+            target = "main"
+        elif line.startswith("[股票Bot]"):
+            target = "stock"
+        _log(line, bot_key=target)
 
 
 # ── tmux capture for Claude Code live output ──────────────────────────────────
-_tmux_prev_snapshot = ""          # normalized full text of last capture
-_tmux_prev_norm_lines = []        # normalized lines of last capture
 _tmux_capture_running = False
+# 每个 Bot 一份 prev 状态，用于 diff 出新增行
+_tmux_states = {k: {"prev_snapshot": "", "prev_norm_lines": []} for k in BOTS}
 
 def _normalize_tmux(line):
     """Strip all ANSI/OSC/control sequences and whitespace for reliable comparison."""
@@ -194,46 +251,50 @@ def _dedup_key(line):
     import re
     return re.sub(r"\s+", " ", line).strip()
 
+def _capture_one_bot(bot_key):
+    """单次捕获指定 Bot tmux pane 的新增行，写入该 Bot 的日志缓冲。"""
+    profile = _bot_or_default(bot_key)
+    sess    = profile["tmux_session"]
+    state   = _tmux_states[bot_key]
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", sess, "-p", "-S", "-50"],
+            capture_output=True, timeout=3
+        )
+    except Exception:
+        return
+    if result.returncode != 0:
+        return
+    raw_lines  = result.stdout.decode(errors="replace").splitlines()
+    norm_lines = [_normalize_tmux(l) for l in raw_lines]
+    while norm_lines and not norm_lines[-1]:
+        norm_lines.pop()
+    snapshot = "\n".join(norm_lines)
+    if snapshot == state["prev_snapshot"]:
+        state["prev_norm_lines"] = norm_lines
+        state["prev_snapshot"]   = snapshot
+        return
+    prev = state["prev_norm_lines"]
+    new_start = 0
+    if prev:
+        for i in range(len(prev), 0, -1):
+            if norm_lines[:i] == prev[-i:]:
+                new_start = i
+                break
+    for line in norm_lines[new_start:]:
+        if line:
+            _log_claude(line, bot_key=bot_key)
+    state["prev_norm_lines"] = norm_lines
+    state["prev_snapshot"]   = snapshot
+
+
 def _tmux_capture_loop():
-    """Background thread: capture tmux pane content and push new lines to SSE."""
-    global _tmux_prev_snapshot, _tmux_prev_norm_lines, _tmux_capture_running
+    """轮询所有 Bot 的 tmux pane，新增行分别写入各自缓冲。"""
+    global _tmux_capture_running
     _tmux_capture_running = True
     while _tmux_capture_running:
-        try:
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", TMUX_SESSION, "-p", "-S", "-50"],
-                capture_output=True, timeout=3
-            )
-            if result.returncode == 0:
-                raw_lines = result.stdout.decode(errors="replace").splitlines()
-                # Normalize each line for comparison
-                norm_lines = [_normalize_tmux(l) for l in raw_lines]
-                # Remove trailing empty lines
-                while norm_lines and not norm_lines[-1]:
-                    norm_lines.pop()
-                # Build snapshot string for quick full-compare
-                snapshot = "\n".join(norm_lines)
-                # If nothing changed at all, skip entirely
-                if snapshot == _tmux_prev_snapshot:
-                    _tmux_prev_norm_lines = norm_lines
-                    _tmux_prev_snapshot = snapshot
-                    continue
-                # Find new lines: match longest suffix of prev at start of cur
-                prev = _tmux_prev_norm_lines
-                new_start = 0
-                if prev:
-                    for i in range(len(prev), 0, -1):
-                        if norm_lines[:i] == prev[-i:]:
-                            new_start = i
-                            break
-                new_lines = norm_lines[new_start:]
-                for line in new_lines:
-                    if line:
-                        _log_claude(line)
-                _tmux_prev_norm_lines = norm_lines
-                _tmux_prev_snapshot = snapshot
-        except Exception:
-            pass
+        for bot_key in BOTS:
+            _capture_one_bot(bot_key)
         time.sleep(3)
 
 
@@ -269,51 +330,42 @@ def _should_skip_claude_line(line):
         return True
     return False
 
-_logged_recent_set = set()     # O(1) lookup for dedup
-_logged_recent_list = []       # ordered list to evict oldest
-_last_log_time = 0             # 上一条日志时间戳，用于判断是否续行
 _BLOCK_LEADERS = ("●", "❯", "⎿", "✢", "✶", "✷", "✸", "✺", "⏺", "*", "·")  # 新消息块起始字符
+# 每个 Bot 一份去重集合 + 上次输出时间戳，避免互相干扰
+_claude_state = {
+    k: {"recent_set": set(), "recent_list": [], "last_log_time": 0}
+    for k in BOTS
+}
 
-def _log_claude(line):
-    """Log a Claude Code output line with [Claude] prefix.
+def _log_claude(line, bot_key="main"):
+    """Log a Claude Code output line with [Claude] prefix into the bot's buffer.
     连续输出的续行（2秒内、且不是新块起始）只缩进不加时间戳前缀，避免把一段话切碎。"""
-    global _last_log_time
     if _should_skip_claude_line(line):
         return
+    st = _claude_state.get(bot_key) or _claude_state["main"]
     # Deduplicate using whitespace-collapsed key to absorb re-render diffs
     key = _dedup_key(line)
     if not key:
         return
-    if key in _logged_recent_set:
+    if key in st["recent_set"]:
         return
-    _logged_recent_set.add(key)
-    _logged_recent_list.append(key)
-    if len(_logged_recent_list) > 1000:
-        old = _logged_recent_list.pop(0)
-        _logged_recent_set.discard(old)
+    st["recent_set"].add(key)
+    st["recent_list"].append(key)
+    if len(st["recent_list"]) > 1000:
+        old = st["recent_list"].pop(0)
+        st["recent_set"].discard(old)
     now = time.time()
     stripped = line.lstrip()
     # 判定是否为一个新逻辑块：超过2秒没输出，或行首是块起始字符
-    is_new_block = (now - _last_log_time > 2.0) or any(stripped.startswith(c) for c in _BLOCK_LEADERS)
+    is_new_block = (now - st["last_log_time"] > 2.0) or any(stripped.startswith(c) for c in _BLOCK_LEADERS)
     if is_new_block:
         ts = time.strftime("%H:%M:%S")
         entry = f"[{ts}] [Claude] {line.rstrip()}"
     else:
         # 续行：用等宽空白对齐到前缀位置，读起来像一段
         entry = f"                    {line.rstrip()}"
-    _last_log_time = now
-    with _log_lock:
-        global _log_seq
-        _log_seq += 1
-        _log_buffer.append((_log_seq, entry))
-        if len(_log_buffer) > MAX_LOG_LINES:
-            _log_buffer.pop(0)
-    with _sse_lock:
-        for q in list(_sse_queues):
-            try:
-                q.put_nowait(entry)
-            except queue.Full:
-                pass
+    st["last_log_time"] = now
+    _push_log(bot_key, entry)
 
 
 def start_bridge():
@@ -359,20 +411,24 @@ def stop_bridge():
     return {"ok": True}
 
 
-def get_status():
+def get_status(bot_key="main"):
+    profile = _bot_or_default(bot_key)
     running = _bridge_proc is not None and _bridge_proc.poll() is None
     uptime  = int(time.time() - _bridge_start_time) if running and _bridge_start_time else 0
     pid     = _bridge_proc.pid if running and _bridge_proc else None
 
-    model = "claude-sonnet-4-6"
-    if os.path.exists(MODEL_FILE):
+    # Per-bot 模型
+    model_file = profile["model_file"]
+    model = profile["default_model"]
+    if os.path.exists(model_file):
         try:
-            m = open(MODEL_FILE).read().strip()
+            m = open(model_file).read().strip()
             if m:
                 model = m
         except Exception:
             pass
 
+    # Token 统计目前是全局的（bridge.py 没分桶），暂保留共用
     tokens = {"input": 0, "output": 0}
     if os.path.exists(TOKEN_STATS_FILE):
         try:
@@ -380,23 +436,30 @@ def get_status():
         except Exception:
             pass
 
+    # Webhook 是 bridge 全局的，两个 Bot 共一个隧道
     webhook = None
     try:
         content = open(LTLOG).read()
-        m = re.search(r'https://[^\s]+\.loca\.lt', content)
+        m = re.search(r'https://[^\s]+(?:\.ngrok-free\.dev|\.loca\.lt|\.trycloudflare\.com)', content)
         if m:
             webhook = m.group(0)
     except Exception:
         pass
 
+    # Per-bot chat_id
     chat_id = None
-    if os.path.exists(CHAT_ID_FILE):
+    if os.path.exists(profile["chat_id_file"]):
         try:
-            chat_id = open(CHAT_ID_FILE).read().strip()
+            chat_id = open(profile["chat_id_file"]).read().strip()
         except Exception:
             pass
 
+    # Per-bot tmux 状态
+    tmux_running = _tmux_session_exists(profile["tmux_session"])
+
     return {
+        "bot":     bot_key,
+        "name":    profile["name"],
         "running": running,
         "pid":     pid,
         "uptime":  uptime,
@@ -404,6 +467,8 @@ def get_status():
         "tokens":  tokens,
         "webhook": webhook,
         "chat_id": chat_id,
+        "tmux":    profile["tmux_session"],
+        "tmux_running": tmux_running,
     }
 
 
@@ -495,6 +560,29 @@ body::after{
   border:1px solid var(--border);border-radius:4px;
   padding:2px 7px;letter-spacing:.5px;
 }
+
+/* ── Bot Switcher ── */
+.bot-tabs{
+  display:flex;gap:6px;
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:12px;padding:4px;
+  max-width:480px;width:100%;margin-bottom:16px;
+}
+.bot-tab{
+  flex:1;background:transparent;border:none;cursor:pointer;
+  padding:8px 12px;border-radius:9px;
+  font-family:var(--font-mono);font-size:12px;font-weight:600;
+  color:var(--text2);letter-spacing:.5px;
+  transition:all .2s;display:flex;align-items:center;justify-content:center;gap:6px;
+}
+.bot-tab:hover{color:var(--text3)}
+.bot-tab.active{
+  background:linear-gradient(135deg,rgba(0,212,255,.12),rgba(0,212,255,.05));
+  color:var(--accent);
+  box-shadow:0 0 0 1px rgba(0,212,255,.25);
+}
+.bot-tab-dot{width:6px;height:6px;border-radius:50%;background:var(--text2);transition:all .2s}
+.bot-tab.active .bot-tab-dot{background:var(--green);box-shadow:0 0 6px var(--green)}
 
 /* ── Power Button ── */
 .power-wrap{
@@ -789,6 +877,16 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
   <div class="header-ver">v2.0</div>
 </div>
 
+<!-- Bot Switcher -->
+<div class="bot-tabs" id="botTabs">
+  <button class="bot-tab active" data-bot="main" onclick="switchBot('main')">
+    <span class="bot-tab-dot"></span>主控Bot
+  </button>
+  <button class="bot-tab" data-bot="stock" onclick="switchBot('stock')">
+    <span class="bot-tab-dot"></span>股票Bot
+  </button>
+</div>
+
 <!-- Power Button -->
 <div class="power-wrap">
   <div class="power-ring">
@@ -901,7 +999,23 @@ const MODELS=[
   {id:"qwen-plus",        name:"通义千问 Plus",        prov:"Bailian",   icon:"🌤", desc:"性价比之选",             badge:"cheap",  badgeTxt:"FAST"},
 ];
 
-let paused=false,isRunning=false,curModel="claude-sonnet-4-6";
+let paused=false,isRunning=false,curModel="claude-sonnet-4-6",curBot="main";
+
+function switchBot(bot){
+  if(bot===curBot)return;
+  curBot=bot;
+  document.querySelectorAll(".bot-tab").forEach(el=>{
+    el.classList.toggle("active",el.dataset.bot===bot);
+  });
+  // 清空当前日志并重连 SSE 拉新 Bot 的内容
+  document.getElementById("log-output").innerHTML="";
+  _pollSeq=0;
+  if(_sse){try{_sse.close();}catch(e){}_sse=null;}
+  if(_pollTimer){clearTimeout(_pollTimer);_pollTimer=null;_usePolling=false;}
+  fetchStatus();
+  startSSE();
+  toast("已切换到 "+(bot==="stock"?"股票Bot":"主控Bot"));
+}
 
 // Build model sheet
 function buildSheet(){
@@ -1013,7 +1127,7 @@ function updateUI(s){
 }
 
 async function fetchStatus(){
-  try{const r=await fetch("/api/status");updateUI(await r.json());}catch(e){}
+  try{const r=await fetch("/api/status?bot="+curBot);updateUI(await r.json());}catch(e){}
 }
 async function toggleBridge(){
   const action=isRunning?"stop":"start";
@@ -1026,9 +1140,10 @@ async function toggleBridge(){
 }
 async function switchModel(model,m){
   try{
-    const r=await fetch("/api/model",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model})});
+    const r=await fetch("/api/model",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model,bot:curBot})});
     const d=await r.json();
-    toast(d.ok?"已切换：" +(m?m.name:model):"切换失败: "+d.error);
+    const tag=curBot==="stock"?"[股票Bot] ":"[主控Bot] ";
+    toast(d.ok?tag+"已切换：" +(m?m.name:model):"切换失败: "+d.error);
     fetchStatus();
   }catch(e){toast("请求失败");}
 }
@@ -1085,7 +1200,7 @@ function startPolling(){
   _usePolling=true;
   toast("SSE不可用，已切换轮询模式");
   function poll(){
-    fetch("/api/logs/snapshot?since="+_pollSeq)
+    fetch("/api/logs/snapshot?bot="+curBot+"&since="+_pollSeq)
       .then(r=>r.json())
       .then(d=>{
         if(d.lines&&d.lines.length>0){
@@ -1102,7 +1217,7 @@ function startSSE(){
   if(_usePolling){startPolling();return;}
   if(_sse){try{_sse.close();}catch(e){}_sse=null;}
   if(_sseReconnect){clearTimeout(_sseReconnect);_sseReconnect=null;}
-  const es=new EventSource("/api/logs");
+  const es=new EventSource("/api/logs?bot="+curBot);
   _sse=es;
   let first=true;
   es.onmessage=(e)=>{
@@ -1157,30 +1272,42 @@ setInterval(fetchStatus,3000);
 class DashboardHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def _query_bot(self):
+        """Parse ?bot= from query string, default 'main'."""
+        from urllib.parse import parse_qs, urlparse as _up
+        qs  = parse_qs(_up(self.path).query)
+        bot = qs.get("bot", ["main"])[0]
+        return bot if bot in BOTS else "main"
+
     def do_GET(self):
         path = urlparse(self.path).path
 
         if path in ("/", "/index.html"):
             self._html(HTML)
 
+        elif path == "/api/bots":
+            self._json({k: {"name": v["name"]} for k, v in BOTS.items()})
+
         elif path == "/api/status":
-            self._json(get_status())
+            self._json(get_status(self._query_bot()))
 
         elif path == "/api/logs":
-            self._sse_stream()
+            self._sse_stream(self._query_bot())
 
         elif path == "/api/logs/snapshot":
-            # Polling fallback: ?since=<seq> returns new lines with seq > since
+            # Polling fallback: ?since=<seq>&bot=main|stock returns new lines with seq > since
             from urllib.parse import parse_qs, urlparse as _up
             qs = parse_qs(_up(self.path).query)
             try:
                 since = int(qs.get("since", ["0"])[0])
             except Exception:
                 since = 0
+            bot_key = self._query_bot()
             with _log_lock:
-                new = [(seq, text) for seq, text in _log_buffer if seq > since]
+                buf = _log_buffers[bot_key]
+                new = [(seq, text) for seq, text in buf if seq > since]
                 new = new[-50:]
-                max_seq = _log_buffer[-1][0] if _log_buffer else 0
+                max_seq = buf[-1][0] if buf else 0
             self._json({"lines": [text for _, text in new], "seq": max_seq})
 
         elif path == "/api/keys":
@@ -1207,15 +1334,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(stop_bridge())
 
         elif path == "/api/model":
-            model = data.get("model", "")
+            model   = data.get("model", "")
+            bot_key = data.get("bot") or self._query_bot()
+            if bot_key not in BOTS:
+                bot_key = "main"
             if not model:
                 self._json({"ok": False, "error": "no model"})
                 return
             try:
-                with open(MODEL_FILE, "w") as f:
+                with open(BOTS[bot_key]["model_file"], "w") as f:
                     f.write(model)
-                _relaunch_claude(model)
-                self._json({"ok": True, "model": model})
+                _relaunch_claude(model, bot_key=bot_key)
+                self._json({"ok": True, "model": model, "bot": bot_key})
             except Exception as e:
                 self._json({"ok": False, "error": str(e)})
 
@@ -1246,7 +1376,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _sse_stream(self):
+    def _sse_stream(self, bot_key="main"):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -1255,10 +1385,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
+        if bot_key not in BOTS:
+            bot_key = "main"
+
         q = queue.Queue(maxsize=200)
         # Flush last 50 buffered lines first
         with _log_lock:
-            lines = [text for _, text in _log_buffer[-50:]]
+            lines = [text for _, text in _log_buffers[bot_key][-50:]]
         for line in lines:
             try:
                 self.wfile.write(f"data: {line}\n\n".encode())
@@ -1270,7 +1403,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         with _sse_lock:
-            _sse_queues.append(q)
+            _sse_queues[bot_key].append(q)
 
         try:
             while True:
@@ -1286,7 +1419,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         finally:
             with _sse_lock:
                 try:
-                    _sse_queues.remove(q)
+                    _sse_queues[bot_key].remove(q)
                 except ValueError:
                     pass
 
