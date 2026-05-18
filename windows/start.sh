@@ -5,6 +5,7 @@ source /etc/claude_env.sh 2>/dev/null
 source ~/.profile 2>/dev/null
 
 TOKEN="${TELEGRAM_BOT_TOKEN}"
+STOCK_TOKEN="${STOCK_BOT_TOKEN}"   # 股票Bot token（可选）
 PROJECT="/mnt/d/AI/claudecode-telegram-main"
 PORT=9999
 
@@ -142,7 +143,7 @@ if [ -n "$TMUX" ]; then
     echo "[4] Starting dashboard on port 8888..."
     pkill -f "dashboard.py" 2>/dev/null; sleep 0.3
     fuser -k 8888/tcp 2>/dev/null; sleep 0.3
-    nohup env TELEGRAM_BOT_TOKEN="$TOKEN" DASHBOARD_PORT=8888 python3 "$PROJECT/dashboard.py" > /tmp/dashboard.log 2>&1 &
+    nohup env TELEGRAM_BOT_TOKEN="$TOKEN" STOCK_BOT_TOKEN="$STOCK_TOKEN" DASHBOARD_PORT=8888 python3 "$PROJECT/dashboard.py" > /tmp/dashboard.log 2>&1 &
     echo "    Dashboard started (log: /tmp/dashboard.log)"
 
     # 3.5. Start cloudflared tunnel for dashboard (mobile access) with auto-reconnect

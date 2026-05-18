@@ -15,6 +15,9 @@ import hmac
 import hashlib
 import base64
 
+# Bypass system proxy — proxy at 127.0.0.1:65533 breaks TLS to Telegram/external APIs
+urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
+
 TMUX_SESSION  = os.environ.get("TMUX_SESSION", "claude")
 LTLOG         = "/tmp/lt_bridge.log"
 CHAT_ID_FILE = os.path.expanduser("~/.claude/telegram_chat_id")
@@ -22,26 +25,49 @@ RESTART_NOTIFY_FILE = os.path.expanduser("~/.claude/telegram_restart_notify")
 PENDING_FILE = os.path.expanduser("~/.claude/telegram_pending")
 HISTORY_FILE = os.path.expanduser("~/.claude/history.jsonl")
 MODEL_FILE = os.path.expanduser("~/.claude/telegram_model")
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+BOT_TOKEN       = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+STOCK_BOT_TOKEN = os.environ.get("STOCK_BOT_TOKEN", "")
 PORT = int(os.environ.get("PORT", "9999"))
+
+# ── 多 Bot 配置 ────────────────────────────────────────────────────────────────
+# key = webhook 路径, value = bot 配置
+# system_prompt=None 表示不注入特殊提示词（主控Bot用全局CLAUDE.md）
+BOT_PROFILES = {
+    "/": {
+        "name":          "主控Bot",
+        "token":         "",            # 运行时填充（startup 里赋值）
+        "system_prompt": None,          # 不注入：走全局 CLAUDE.md
+    },
+    "/stock": {
+        "name":  "股票Bot",
+        "token": "",                    # 运行时填充
+        "system_prompt": (
+            "你是专业A股量化投资分析师，具备深厚的技术分析、基本面分析和量化策略能力。\n"
+            "【数据获取】优先用 akshare 库拉取实时/历史数据，不要捏造数据。\n"
+            "【分析必含】K线走势、MACD、RSI14、KDJ、成交量、均线(MA5/10/20/60)、布林带。\n"
+            "【操作建议】必须给出明确结论：买入 / 持有 / 减仓 / 卖出，并注明关键支撑位和压力位。\n"
+            "【可视化】有图表时用 matplotlib/mplfinance 生成并保存到 /tmp/，再告知路径。\n"
+            "【语言】始终用中文回复，数字保留2位小数。\n"
+            "【态度】直接给结论，不要废话，不要免责声明开头。"
+        ),
+    },
+}
 WECHAT_SEND_FILE = "/tmp/wechat_send.json"
 WECHAT_BOT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wechat_bot.py")
-TDX_MONITOR_SCRIPT = "/mnt/d/股票/scripts/tdx_monitor.py"
-TDX_SIGNAL_GEN_SCRIPT = "/mnt/d/股票/scripts/tdx_signal_gen.py"
-TDX_FORMULA_SCRIPT = "/mnt/d/股票/scripts/tdx_formula.py"
-THS_READER_SCRIPT = "/mnt/d/股票/scripts/ths_reader.py"
-THS_FORMULA_SCRIPT = "/mnt/d/股票/scripts/ths_formula.py"
-STOCK_SYNC_SCRIPT = "/mnt/d/股票/scripts/stock_sync.py"
-THS_ORDER_MONITOR_SCRIPT = "/mnt/d/股票/scripts/ths_order_monitor.py"
-AUTO_TRADER_SCRIPT = "/mnt/d/股票/scripts/auto_trader.py"
-STOCK_WATCHLIST_FILE = "/mnt/d/股票/data/my_watchlist.json"
+TDX_MONITOR_SCRIPT = "/mnt/d/cao_stock/scripts/monitor/price_monitor.py"
+TDX_SIGNAL_GEN_SCRIPT = "/mnt/d/cao_stock/scripts/broker/ths_trade_signal.py"
+TDX_FORMULA_SCRIPT = "/mnt/d/cao_stock/scripts/tools/ths_formula.py"
+THS_READER_SCRIPT = "/mnt/d/cao_stock/scripts/data/ths_reader.py"
+THS_FORMULA_SCRIPT = "/mnt/d/cao_stock/scripts/tools/ths_formula.py"
+STOCK_SYNC_SCRIPT = "/mnt/d/cao_stock/scripts/data/ths_reader.py"
+THS_ORDER_MONITOR_SCRIPT = "/mnt/d/cao_stock/scripts/monitor/ths_order_monitor.py"
+STOCK_WATCHLIST_FILE = "/mnt/d/cao_stock/data/my_watchlist.json"
 API_KEYS_FILE    = os.path.expanduser("~/.claude/telegram_api_keys.json")
 TOKEN_STATS_FILE = os.path.expanduser("~/.claude/telegram_token_stats.json")
 
 _wechat_proc = None   # wechat_bot.py subprocess
 _tdx_proc = None      # tdx_monitor.py subprocess
 _order_proc = None    # ths_order_monitor.py subprocess
-_auto_proc = None     # auto_trader.py subprocess
 _conv_history = {}    # chat_id (str) -> list of {"role": ..., "content": ...}
 
 GLOBAL_CLAUDE_MD = os.path.expanduser("~/.claude/CLAUDE.md")
@@ -61,11 +87,11 @@ def load_global_context():
 
 MODELS = [
     # (model_id, display_label, provider, has_thinking)
-    ("claude-opus-4-6",           "Opus 4.6 — 最强",         "claude",   True),
+    ("claude-opus-4-7",           "Opus 4.7 — 最强",         "claude",   True),
     ("claude-sonnet-4-6",         "Sonnet 4.6 — 均衡",        "claude",   True),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — 最快",         "claude",   False),
-    ("deepseek-chat",             "DeepSeek V3 — 均衡",       "deepseek", False),
-    ("deepseek-reasoner",         "DeepSeek R1 — 深度推理",   "deepseek", True),
+    ("deepseek-v4-flash",         "DeepSeek V4 Flash — 经济",  "deepseek", True),
+    ("deepseek-v4-pro",           "DeepSeek V4 Pro — 旗舰",    "deepseek", True),
     ("glm-4-plus",                "GLM-4 Plus — 均衡",        "zhipu",    False),
     ("glm-4-flash",               "GLM-4 Flash — 快速免费",   "zhipu",    False),
     ("abab6.5s-chat",             "MiniMax 6.5s",             "minimax",  False),
@@ -74,8 +100,8 @@ MODELS = [
 ]
 
 PROVIDERS = {
-    "claude":   ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
-    "deepseek": ["deepseek-chat", "deepseek-reasoner"],
+    "claude":   ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro"],
     "zhipu":    ["glm-4-plus", "glm-4-flash"],
     "minimax":  ["abab6.5s-chat"],
     "bailian":  ["qwen-max", "qwen-plus", "qwen-turbo"],
@@ -85,8 +111,8 @@ PROVIDERS = {
 # Non-Claude models need a Claude-style alias for Claude Code CLI to accept
 # Each model gets a UNIQUE alias so LiteLLM can route correctly
 CLI_MODEL_ALIAS = {
-    "deepseek-chat":     "claude-3-5-sonnet-20241022",
-    "deepseek-reasoner": "claude-3-opus-20240229",
+    "deepseek-v4-flash": "claude-3-5-sonnet-20241022",
+    "deepseek-v4-pro":   "claude-3-opus-20240229",
     "glm-4-plus":        "claude-3-sonnet-20240229",
     "glm-4-flash":       "claude-3-haiku-20240307",
     "abab6.5s-chat":     "claude-3-5-haiku-20241022",
@@ -119,15 +145,29 @@ def model_flag():
     return f" --model {m}" if m else ""
 
 
+# 厂商原生支持 Anthropic 格式的端点：直连，跳过 anthropic_proxy + LiteLLM
+NATIVE_ANTHROPIC_BASE = {
+    "deepseek": "https://api.deepseek.com/anthropic",
+}
+
+
 def claude_launch_cmd(model=None, extra_args=""):
     """Build the full claude launch command, with ANTHROPIC_BASE_URL for non-Claude models."""
-    m = model or get_model() or "claude-opus-4-6"
+    m = model or get_model() or "claude-opus-4-7"
     provider = get_provider(m)
     if provider == "claude":
         return f"claude --dangerously-skip-permissions --model {m}{extra_args}"
-    else:
-        cli_model = get_cli_model(m)
-        return f"ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL={ANTHROPIC_PROXY_URL} claude --dangerously-skip-permissions --model {cli_model}{extra_args}"
+    # 原生 Anthropic 端点：直连厂商，model 用真名，key 用真 key
+    if provider in NATIVE_ANTHROPIC_BASE:
+        key = get_api_keys().get(provider, "")
+        if key:
+            _approve_custom_key(key)
+            base = NATIVE_ANTHROPIC_BASE[provider]
+            return f"ANTHROPIC_API_KEY={key} ANTHROPIC_BASE_URL={base} claude --dangerously-skip-permissions --model {m}{extra_args}"
+    # 兜底：走本地 anthropic_proxy → LiteLLM
+    _approve_custom_key("sk-placeholder")
+    cli_model = get_cli_model(m)
+    return f"ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL={ANTHROPIC_PROXY_URL} claude --dangerously-skip-permissions --model {cli_model}{extra_args}"
 
 
 # ── Multi-provider support ────────────────────────────────────────────────────
@@ -266,24 +306,32 @@ BLOCKED_COMMANDS = [
 ]
 
 
-def telegram_api(method, data):
-    if not BOT_TOKEN:
+def telegram_api(method, data, token=None):
+    t = token or BOT_TOKEN
+    if not t:
         return None
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
-        data=json.dumps(data).encode(),
-        headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="ignore")
-        print(f"Telegram API error [{method}]: {e} | {body}")
-        return None
-    except Exception as e:
-        print(f"Telegram API error [{method}]: {e}")
-        return None
+    body = json.dumps(data).encode()
+    last_err = None
+    for attempt in range(3):
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{t}/{method}",
+            data=body,
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            # 4xx 不重试（请求本身有错）
+            err_body = e.read().decode(errors="ignore")
+            print(f"Telegram API error [{method}]: {e} | {err_body}")
+            return None
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(0.8 * (attempt + 1))  # 0.8s, 1.6s 退避
+    print(f"Telegram API failed [{method}] after 3 attempts: {last_err}")
+    return None
 
 
 def setup_bot_commands():
@@ -292,14 +340,14 @@ def setup_bot_commands():
         print("Bot commands registered")
 
 
-def send_typing_loop(chat_id):
+def send_typing_loop(chat_id, token=None):
     start = time.time()
     while os.path.exists(PENDING_FILE):
         if time.time() - start > 300:
             if os.path.exists(PENDING_FILE):
                 os.remove(PENDING_FILE)
             return
-        telegram_api("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+        telegram_api("sendChatAction", {"chat_id": chat_id, "action": "typing"}, token=token)
         time.sleep(4)
 
 
@@ -326,6 +374,37 @@ def tmux_send_with_enter(text):
     subprocess.run(["tmux", "paste-buffer", "-t", TMUX_SESSION])
     time.sleep(0.3)
     subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"])
+
+
+CLAUDE_JSON_PATH = os.path.expanduser("~/.claude.json")
+
+
+def _approve_custom_key(api_key):
+    """预写 ~/.claude.json 的 approved 列表，让 Claude CLI 不再弹 'Do you want to use this API key?'。
+    CLI 用 key 的后 20 位做标识。"""
+    if not api_key or len(api_key) < 20:
+        return
+    suffix = api_key[-20:]
+    try:
+        cfg = json.load(open(CLAUDE_JSON_PATH))
+    except Exception:
+        return
+    resp = cfg.setdefault("customApiKeyResponses", {})
+    approved = resp.setdefault("approved", [])
+    rejected = resp.setdefault("rejected", [])
+    changed = False
+    if suffix in rejected:
+        rejected.remove(suffix)
+        changed = True
+    if suffix not in approved:
+        approved.append(suffix)
+        changed = True
+    if changed:
+        try:
+            with open(CLAUDE_JSON_PATH, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
 
 
 def tmux_send_escape():
@@ -361,7 +440,14 @@ def get_session_id(project_path):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _get_profile(self):
+        """Return bot profile matching the request path, fallback to '/'."""
+        path = self.path.split("?")[0].rstrip("/") or "/"
+        return BOT_PROFILES.get(path) or BOT_PROFILES.get("/")
+
     def do_POST(self):
+        self.profile = self._get_profile()
+        self.bot_token = self.profile.get("token") or BOT_TOKEN
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         try:
             update = json.loads(body)
@@ -383,7 +469,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle_callback(self, cb):
         chat_id = cb.get("message", {}).get("chat", {}).get("id")
         data = cb.get("data", "")
-        telegram_api("answerCallbackQuery", {"callback_query_id": cb.get("id")})
+        telegram_api("answerCallbackQuery", {"callback_query_id": cb.get("id")}, token=self.bot_token)
 
         if chat_id not in ALLOWED_CHAT_IDS:
             return
@@ -439,11 +525,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def download_file(self, file_id, filename):
         """Download a file from Telegram by file_id, return local file path or None."""
-        result = telegram_api("getFile", {"file_id": file_id})
+        result = telegram_api("getFile", {"file_id": file_id}, token=self.bot_token)
         if not result or not result.get("ok"):
             return None
         file_path = result["result"]["file_path"]
-        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        url = f"https://api.telegram.org/file/bot{self.bot_token}/{file_path}"
         ext = filename.rsplit(".", 1)[-1] if "." in filename else file_path.rsplit(".", 1)[-1]
         safe_name = filename.replace("/", "_").replace("\\", "_")
         local_path = f"/tmp/{safe_name}"
@@ -458,11 +544,11 @@ class Handler(BaseHTTPRequestHandler):
         """Download the largest photo from Telegram, return local file path or None."""
         largest = max(photo_list, key=lambda p: p.get("file_size", 0))
         file_id = largest.get("file_id")
-        result = telegram_api("getFile", {"file_id": file_id})
+        result = telegram_api("getFile", {"file_id": file_id}, token=self.bot_token)
         if not result or not result.get("ok"):
             return None
         file_path = result["result"]["file_path"]
-        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        url = f"https://api.telegram.org/file/bot{self.bot_token}/{file_path}"
         ext = file_path.rsplit(".", 1)[-1] if "." in file_path else "jpg"
         local_path = f"/tmp/telegram_photo_{int(time.time())}.{ext}"
         try:
@@ -528,7 +614,7 @@ class Handler(BaseHTTPRequestHandler):
             cmd = text.split()[0].lower()
 
             if cmd == "/status":
-                cur_model = get_model() or "claude-opus-4-6"
+                cur_model = get_model() or "claude-opus-4-7"
                 cur_label = next((l for m, l, *_ in MODELS if m == cur_model), cur_model)
                 cur_provider = get_provider(cur_model)
                 tmux_status = "running" if tmux_exists() else "not found"
@@ -570,7 +656,7 @@ class Handler(BaseHTTPRequestHandler):
                 full = f'{prompt} Output <promise>DONE</promise> when complete.'
                 with open(PENDING_FILE, "w") as f:
                     f.write(str(int(time.time())))
-                threading.Thread(target=send_typing_loop, args=(chat_id,), daemon=True).start()
+                threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token), daemon=True).start()
                 tmux_send(f'/ralph-loop:ralph-loop "{full}" --max-iterations 5 --completion-promise "DONE"')
                 time.sleep(0.3)
                 tmux_send_enter()
@@ -647,13 +733,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if cmd == "/model":
-                current = get_model() or "claude-opus-4-6"
+                current = get_model() or "claude-opus-4-7"
                 kb = [[{"text": f"{'✓ ' if current == m else ''}{label}", "callback_data": f"model:{m}"}] for m, label, *_ in MODELS]
                 telegram_api("sendMessage", {
                     "chat_id": chat_id,
                     "text": f"当前模型：{current}\n选择新模型：",
                     "reply_markup": {"inline_keyboard": kb}
-                })
+                }, token=self.bot_token)
                 return
 
             if cmd == "/resume":
@@ -666,7 +752,7 @@ class Handler(BaseHTTPRequestHandler):
                     sid = get_session_id(s.get("project", ""))
                     if sid:
                         kb.append([{"text": s.get("display", "?")[:40] + "...", "callback_data": f"resume:{sid}"}])
-                telegram_api("sendMessage", {"chat_id": chat_id, "text": "Select session:", "reply_markup": {"inline_keyboard": kb}})
+                telegram_api("sendMessage", {"chat_id": chat_id, "text": "Select session:", "reply_markup": {"inline_keyboard": kb}}, token=self.bot_token)
                 return
 
             if cmd in BLOCKED_COMMANDS:
@@ -679,17 +765,32 @@ class Handler(BaseHTTPRequestHandler):
 
         # Regular message
         print(f"[{chat_id}] {text[:50]}...")
-        model    = get_model() or "claude-opus-4-6"
+        model    = get_model() or "claude-opus-4-7"
         provider = get_provider(model)
+
+        # Busy-guard: if Claude is still processing previous message, reject to avoid tmux queue pile-up
+        if os.path.exists(PENDING_FILE):
+            try:
+                pt = int(open(PENDING_FILE).read().strip())
+                if time.time() - pt < 600:
+                    self.reply(chat_id, "⏳ Claude 还在处理上一条消息，请稍候再发（如要中断用 /stop）")
+                    return
+            except:
+                try: os.remove(PENDING_FILE)
+                except: pass
 
         with open(PENDING_FILE, "w") as f:
             f.write(str(int(time.time())))
 
-        threading.Thread(target=send_typing_loop, args=(chat_id,), daemon=True).start()
+        threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token), daemon=True).start()
+
+        # Inject bot system_prompt as a leading context note for Claude Code (tmux path)
+        sys_prompt = self.profile.get("system_prompt")
+        injected_text = f"[系统设定]\n{sys_prompt}\n\n[用户消息]\n{text}" if sys_prompt else text
 
         if tmux_exists():
             # Route through Claude Code CLI (works for all models via tmux)
-            tmux_send_with_enter(text)
+            tmux_send_with_enter(injected_text)
         elif provider != "claude":
             # Fallback: direct API call for non-Claude models when tmux is down
             threading.Thread(
@@ -706,7 +807,9 @@ class Handler(BaseHTTPRequestHandler):
         history = _conv_history.setdefault(str(chat_id), [])
         history.append({"role": "user", "content": text})
         global_ctx = load_global_context()
-        messages = ([{"role": "system", "content": global_ctx}] if global_ctx else []) + list(history)
+        # Merge: bot system_prompt overrides global CLAUDE.md for specialised bots
+        sys_prompt = self.profile.get("system_prompt") or global_ctx
+        messages = ([{"role": "system", "content": sys_prompt}] if sys_prompt else []) + list(history)
         result = call_direct_api(provider, model, messages)
         if os.path.exists(PENDING_FILE):
             os.remove(PENDING_FILE)
@@ -745,26 +848,39 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(chat_id, f"🔍 正在让 Claude 分析 {code}...")
         with open(PENDING_FILE, "w") as f:
             f.write(str(int(time.time())))
-        threading.Thread(target=send_typing_loop, args=(chat_id,), daemon=True).start()
+        threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token), daemon=True).start()
         prompt = f"帮我分析股票 {code} 的当前走势，包括均线、MACD、RSI、KDJ，给出操作建议"
         tmux_send_with_enter(prompt)
 
     def _relaunch_claude_for_model(self, chat_id, model, provider):
         """Exit current Claude CLI and relaunch with the new model. Creates tmux session if needed."""
+        # 清残留 PENDING，否则切完模型再发消息会被 busy-guard 挡住
+        if os.path.exists(PENDING_FILE):
+            try: os.remove(PENDING_FILE)
+            except: pass
+
         if tmux_exists():
+            # Escape 退出 Claude UI，C-c 中断任何 shell 前台进程
             tmux_send_escape()
             time.sleep(0.2)
+            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-c"])
+            time.sleep(0.3)
             tmux_send("/exit")
             tmux_send_enter()
             time.sleep(1.5)
+            # 清掉 shell 当前行（防止历史里残留的 claude --resume 被错误回车）
+            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-c"])
+            time.sleep(0.1)
+            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-u"])
+            time.sleep(0.2)
 
         # Re-check: session may have died after /exit (tmux kills session when initial command exits)
         if not tmux_exists():
             subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION], capture_output=True)
             time.sleep(0.5)
 
-        tmux_send(claude_launch_cmd(model))
-        tmux_send_enter()
+        # 用 paste-buffer 送启动命令；claude_launch_cmd 已预写 approved key，不会弹确认
+        tmux_send_with_enter(claude_launch_cmd(model))
 
     # ── 自然语言股票快捷指令 ──────────────────────────────────────────────
 
@@ -826,16 +942,6 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_gp(chat_id, "/gp 公式", "/gp")
             return True
 
-        # "自动盯盘" / "自动交易"
-        if re.match(r'^(?:自动盯盘|自动交易|开始自动)$', t):
-            self._handle_gp(chat_id, "/gp 自动盯盘", "/gp")
-            return True
-
-        # "手动交易" / "停自动" / "关自动"
-        if re.match(r'^(?:手动交易|停自动|关自动|停止自动)$', t):
-            self._handle_gp(chat_id, "/gp 手动交易", "/gp")
-            return True
-
         return False
 
     def _handle_gp(self, chat_id, text, original_cmd="/gp"):
@@ -868,15 +974,10 @@ class Handler(BaseHTTPRequestHandler):
             "status": "status", "formula": "formula",
             "blocks": "blocks", "block": "blocks", "name": "name",
             "list": "selfstock", "trade": "trade",
-            # 自动盯盘
-            "自动盯盘": "autostart", "自动交易": "autostart", "自动": "autostart",
-            "auto": "autostart", "autostart": "autostart",
-            "手动交易": "autostop", "手动": "autostop", "停自动": "autostop",
-            "autostop": "autostop",
         }
         sub = alias.get(sub, sub)
 
-        global _tdx_proc, _order_proc, _auto_proc
+        global _tdx_proc, _order_proc
 
         # ── 扫描信号 ──
         if sub == "scan":
@@ -1059,11 +1160,10 @@ class Handler(BaseHTTPRequestHandler):
         if sub == "status":
             tdx_running = _tdx_proc and _tdx_proc.poll() is None
             order_running = _order_proc and _order_proc.poll() is None
-            auto_running = _auto_proc and _auto_proc.poll() is None
             # 读取监控列表
             wl_count = 0
             wl_names = []
-            wl_path = "/mnt/d/股票/data/watchlist.json"
+            wl_path = "/mnt/d/cao_stock/data/watchlist.json"
             if os.path.exists(wl_path):
                 try:
                     wl_data = json.load(open(wl_path, encoding="utf-8"))
@@ -1074,13 +1174,13 @@ class Handler(BaseHTTPRequestHandler):
             # 待确认订单
             pending_count = 0
             try:
-                pf = "/mnt/d/股票/data/pending_orders.json"
+                pf = "/mnt/d/cao_stock/data/pending_orders.json"
                 if os.path.exists(pf):
                     pd_data = json.load(open(pf, encoding="utf-8"))
                     pending_count = sum(1 for o in pd_data.get("orders", []) if o.get("status") == "pending")
             except Exception:
                 pass
-            mode = "🤖 自动盯盘" if auto_running else ("👤 手动确认" if order_running else "❌ 未启动")
+            mode = "👤 手动确认" if order_running else "❌ 未启动"
             msg = (
                 f"📊 股票状态\n\n"
                 f"交易模式：{mode}\n"
@@ -1105,7 +1205,7 @@ class Handler(BaseHTTPRequestHandler):
                     # 同花顺公式
                     subprocess.run([sys.executable, THS_FORMULA_SCRIPT, sub_arg or "all"],
                                    capture_output=True, text=True, timeout=30)
-                    self.reply(chat_id, "✅ 通达信+同花顺公式已生成\n通达信: /mnt/d/股票/output/tdx_formulas/")
+                    self.reply(chat_id, "✅ 通达信+同花顺公式已生成\n通达信: /mnt/d/cao_stock/output/tdx_formulas/")
                 except Exception as e:
                     self.reply(chat_id, f"生成失败: {e}")
             threading.Thread(target=do_formula, daemon=True).start()
@@ -1138,36 +1238,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(chat_id, f"查询失败: {e}")
             return
 
-        # ── 自动盯盘（全自动买卖，无需确认）──
-        if sub == "autostart":
-            if _auto_proc and _auto_proc.poll() is None:
-                self.reply(chat_id, "🤖 自动盯盘已在运行中")
-            else:
-                # 停掉手动监控（避免冲突）
-                if _order_proc and _order_proc.poll() is None:
-                    _order_proc.terminate()
-                env = os.environ.copy()
-                _auto_proc = subprocess.Popen(
-                    [sys.executable, AUTO_TRADER_SCRIPT],
-                    env=env, close_fds=True
-                )
-                self.reply(chat_id,
-                    "🤖 自动盯盘已启动\n\n"
-                    "模式：全自动买卖，无需确认\n"
-                    "我会自己监控行情、选股、买入卖出\n"
-                    "每笔交易会通知你但不等确认\n\n"
-                    "发\"手动交易\"切回确认模式"
-                )
-            return
-
-        if sub == "autostop":
-            if _auto_proc and _auto_proc.poll() is None:
-                _auto_proc.terminate()
-                self.reply(chat_id, "⏹ 自动盯盘已停止，切回手动确认模式")
-            else:
-                self.reply(chat_id, "自动盯盘未在运行")
-            return
-
         # ── 兼容旧 /ths trade 指令 ──
         if sub == "trade":
             trade_sub = sub_arg.lower() if sub_arg else "status"
@@ -1191,15 +1261,13 @@ class Handler(BaseHTTPRequestHandler):
             "对比 — 对比三端差异\n"
             "开监控 — 启动信号+交易监控(需确认)\n"
             "停监控 — 停止全部监控\n"
-            "自动盯盘 — 全自动买卖(无需确认)\n"
-            "手动交易 — 切回手动确认模式\n"
             "状态 — 查看监控状态\n"
             "公式 — 生成全部公式"
         )
 
     def _handle_trade_approval(self, chat_id, order_id, action="approve", market_price=False):
         """处理交易审批回调（确认/拒绝/改市价）"""
-        sys.path.insert(0, "/mnt/d/股票/scripts")
+        sys.path.insert(0, "/mnt/d/cao_stock/scripts")
         try:
             from ths_order_monitor import approve_order, reject_order
 
@@ -1221,6 +1289,10 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(chat_id, f"处理失败: {e}")
 
     def _do_resume(self, chat_id, session_id):
+        # 清残留 PENDING
+        if os.path.exists(PENDING_FILE):
+            try: os.remove(PENDING_FILE)
+            except: pass
         time.sleep(0.3)
         tmux_send_escape()
         time.sleep(0.3)
@@ -1229,17 +1301,21 @@ class Handler(BaseHTTPRequestHandler):
         tmux_send("/exit")
         tmux_send_enter()
         time.sleep(2.0)  # Wait for Claude to fully exit before launching resume
+        # 清掉 shell 当前行
+        subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-c"])
+        time.sleep(0.1)
+        subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-u"])
+        time.sleep(0.2)
         # Re-check: session may have died after /exit
         if not tmux_exists():
             subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION], capture_output=True)
             time.sleep(0.5)
-        tmux_send(claude_launch_cmd(extra_args=f" --resume {session_id}"))
-        tmux_send_enter()
+        tmux_send_with_enter(claude_launch_cmd(extra_args=f" --resume {session_id}"))
 
     def _do_relaunch(self, chat_id):
         """Kill current Claude Code process in tmux and start a fresh one."""
         time.sleep(0.3)
-        cur_model = get_model() or "claude-opus-4-6"
+        cur_model = get_model() or "claude-opus-4-7"
         cur_provider = get_provider(cur_model)
         self._relaunch_claude_for_model(chat_id, cur_model, cur_provider)
         time.sleep(2)
@@ -1257,7 +1333,7 @@ class Handler(BaseHTTPRequestHandler):
         os._exit(0)
 
     def reply(self, chat_id, text):
-        telegram_api("sendMessage", {"chat_id": chat_id, "text": text})
+        telegram_api("sendMessage", {"chat_id": chat_id, "text": text}, token=self.bot_token)
 
     def log_message(self, *args):
         pass
@@ -1266,17 +1342,23 @@ class Handler(BaseHTTPRequestHandler):
 # ── Localtunnel watchdog ──────────────────────────────────────────────────────
 
 def _get_tunnel_url():
+    # ngrok 通过本地 API 4040 取 URL（stdout 缓冲不可靠）
     try:
-        content = open(LTLOG).read()
-        m = re.search(r'https://[^\s]+\.loca\.lt', content)
-        return m.group(0) if m else None
+        req = urllib.request.Request("http://127.0.0.1:4040/api/tunnels")
+        with urllib.request.urlopen(req, timeout=3) as r:
+            data = json.loads(r.read())
+        for t in data.get("tunnels", []):
+            url = t.get("public_url", "")
+            if url.startswith("https://"):
+                return url
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _tunnel_alive(url):
     try:
-        req = urllib.request.Request(url, headers={"bypass-tunnel-reminder": "true"})
+        req = urllib.request.Request(url, headers={"ngrok-skip-browser-warning": "1"})
         with urllib.request.urlopen(req, timeout=10) as r:
             return b"Claude-Telegram Bridge" in r.read(64)
     except Exception:
@@ -1284,15 +1366,17 @@ def _tunnel_alive(url):
 
 
 def _restart_tunnel_and_register():
-    subprocess.run(["pkill", "-f", "lt --port"], capture_output=True)
+    subprocess.run(["pkill", "-f", f"ngrok http {PORT}"], capture_output=True)
     time.sleep(1)
     open(LTLOG, "w").close()
+    env = {k: v for k, v in os.environ.items()
+           if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
     subprocess.Popen(
-        ["npx", "lt", "--port", str(PORT)],
-        stdout=open(LTLOG, "w"), stderr=subprocess.STDOUT
+        ["ngrok", "http", str(PORT), "--log", "stdout", "--log-format=logfmt"],
+        stdout=open(LTLOG, "w"), stderr=subprocess.STDOUT, env=env
     )
     url = None
-    for _ in range(20):
+    for _ in range(30):
         time.sleep(1)
         url = _get_tunnel_url()
         if url:
@@ -1358,15 +1442,45 @@ def _start_anthropic_proxy():
     print(f"[proxy] Anthropic proxy started (PID {_anthropic_proxy_proc.pid})")
 
 
+def _register_all_webhooks(tunnel_url):
+    """Register webhooks for all configured bots."""
+    for path, profile in BOT_PROFILES.items():
+        token = profile.get("token", "")
+        if not token:
+            continue
+        suffix = "" if path == "/" else path
+        webhook_url = f"{tunnel_url}{suffix}"
+        result = telegram_api("setWebhook", {"url": webhook_url}, token=token)
+        ok = result and result.get("ok")
+        print(f"  [{profile['name']}] webhook {webhook_url} → {'OK' if ok else 'FAIL'}")
+        if ok:
+            telegram_api("setMyCommands", {"commands": BOT_COMMANDS}, token=token)
+
+
 def main():
     if not BOT_TOKEN:
         print("Error: TELEGRAM_BOT_TOKEN not set")
         return
+
+    # Fill runtime tokens into BOT_PROFILES
+    BOT_PROFILES["/"]["token"]      = BOT_TOKEN
+    BOT_PROFILES["/stock"]["token"] = STOCK_BOT_TOKEN
+
     notify_restart_if_needed()
-    setup_bot_commands()
     _start_anthropic_proxy()
-    threading.Thread(target=tunnel_watchdog, daemon=True).start()
+
+    # Register webhooks for all bots
+    tunnel_url = _get_tunnel_url()
+    if tunnel_url:
+        print(f"Tunnel: {tunnel_url}")
+        _register_all_webhooks(tunnel_url)
+    else:
+        print("Tunnel not yet available, webhooks will be registered by start.sh")
+        # Fallback: still register main bot via legacy path
+        setup_bot_commands()
+
     print(f"Bridge on :{PORT} | tmux: {TMUX_SESSION}")
+    print(f"Active bots: {[p['name'] for p in BOT_PROFILES.values() if p.get('token')]}")
     try:
         HTTPServer.allow_reuse_address = True
         HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
