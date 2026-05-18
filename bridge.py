@@ -35,20 +35,23 @@ PORT = int(os.environ.get("PORT", "9999"))
 BOT_PROFILES = {
     "/": {
         "name":          "主控Bot",
-        "token":         "",            # 运行时填充（startup 里赋值）
-        "system_prompt": None,          # 不注入：走全局 CLAUDE.md
+        "token":         "",            # 运行时填充
+        "system_prompt": None,          # 走全局 CLAUDE.md
+        "direct_api":    False,         # 走 tmux → Claude Code
+        "model":         None,          # 跟随用户 /model 设置
     },
     "/stock": {
-        "name":  "股票Bot",
-        "token": "",                    # 运行时填充
+        "name":          "股票Bot",
+        "token":         "",            # 运行时填充
+        "direct_api":    True,          # 独立对话，不走 tmux，完全隔离
+        "model":         "deepseek-v4-pro",   # 默认用 DeepSeek，快且免费
         "system_prompt": (
             "你是专业A股量化投资分析师，具备深厚的技术分析、基本面分析和量化策略能力。\n"
             "【数据获取】优先用 akshare 库拉取实时/历史数据，不要捏造数据。\n"
             "【分析必含】K线走势、MACD、RSI14、KDJ、成交量、均线(MA5/10/20/60)、布林带。\n"
             "【操作建议】必须给出明确结论：买入 / 持有 / 减仓 / 卖出，并注明关键支撑位和压力位。\n"
-            "【可视化】有图表时用 matplotlib/mplfinance 生成并保存到 /tmp/，再告知路径。\n"
             "【语言】始终用中文回复，数字保留2位小数。\n"
-            "【态度】直接给结论，不要废话，不要免责声明开头。"
+            "【态度】直接给结论，不要废话。"
         ),
     },
 }
@@ -68,7 +71,7 @@ TOKEN_STATS_FILE = os.path.expanduser("~/.claude/telegram_token_stats.json")
 _wechat_proc = None   # wechat_bot.py subprocess
 _tdx_proc = None      # tdx_monitor.py subprocess
 _order_proc = None    # ths_order_monitor.py subprocess
-_conv_history = {}    # chat_id (str) -> list of {"role": ..., "content": ...}
+_conv_history = {}    # key: "<bot_path>:<chat_id>" -> list of {"role": ..., "content": ...}
 
 GLOBAL_CLAUDE_MD = os.path.expanduser("~/.claude/CLAUDE.md")
 LITELLM_BASE_URL = "http://localhost:4000"
@@ -635,8 +638,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if cmd == "/clear":
-                clear_conv_history(chat_id)
-                if tmux_exists():
+                bot_path = self.path.split("?")[0].rstrip("/") or "/"
+                hist_key = f"{bot_path}:{chat_id}"
+                _conv_history.pop(hist_key, None)
+                if not self.profile.get("direct_api") and tmux_exists():
                     tmux_send_escape()
                     time.sleep(0.2)
                     tmux_send("/clear")
@@ -764,7 +769,22 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # Regular message
-        print(f"[{chat_id}] {text[:50]}...")
+        bot_path = self.path.split("?")[0].rstrip("/") or "/"
+        print(f"[{self.profile['name']}][{chat_id}] {text[:50]}...")
+
+        # ── direct_api bots: fully isolated conversation, never touch tmux ──
+        if self.profile.get("direct_api"):
+            model    = self.profile.get("model") or get_model() or "deepseek-v4-pro"
+            provider = get_provider(model)
+            threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token), daemon=True).start()
+            threading.Thread(
+                target=self._call_api_and_reply,
+                args=(chat_id, text, model, provider, bot_path),
+                daemon=True,
+            ).start()
+            return
+
+        # ── tmux bots: route through Claude Code CLI ──
         model    = get_model() or "claude-opus-4-7"
         provider = get_provider(model)
 
@@ -784,18 +804,12 @@ class Handler(BaseHTTPRequestHandler):
 
         threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token), daemon=True).start()
 
-        # Inject bot system_prompt as a leading context note for Claude Code (tmux path)
-        sys_prompt = self.profile.get("system_prompt")
-        injected_text = f"[系统设定]\n{sys_prompt}\n\n[用户消息]\n{text}" if sys_prompt else text
-
         if tmux_exists():
-            # Route through Claude Code CLI (works for all models via tmux)
-            tmux_send_with_enter(injected_text)
+            tmux_send_with_enter(text)
         elif provider != "claude":
-            # Fallback: direct API call for non-Claude models when tmux is down
             threading.Thread(
                 target=self._call_api_and_reply,
-                args=(chat_id, text, model, provider),
+                args=(chat_id, text, model, provider, bot_path),
                 daemon=True,
             ).start()
         else:
@@ -803,15 +817,17 @@ class Handler(BaseHTTPRequestHandler):
             if os.path.exists(PENDING_FILE):
                 os.remove(PENDING_FILE)
 
-    def _call_api_and_reply(self, chat_id, text, model, provider):
-        history = _conv_history.setdefault(str(chat_id), [])
+    def _call_api_and_reply(self, chat_id, text, model, provider, bot_path="/"):
+        hist_key = f"{bot_path}:{chat_id}"
+        history = _conv_history.setdefault(hist_key, [])
         history.append({"role": "user", "content": text})
         global_ctx = load_global_context()
         # Merge: bot system_prompt overrides global CLAUDE.md for specialised bots
         sys_prompt = self.profile.get("system_prompt") or global_ctx
         messages = ([{"role": "system", "content": sys_prompt}] if sys_prompt else []) + list(history)
         result = call_direct_api(provider, model, messages)
-        if os.path.exists(PENDING_FILE):
+        # Only remove PENDING_FILE for tmux-routed bots (direct_api bots never set it)
+        if not self.profile.get("direct_api") and os.path.exists(PENDING_FILE):
             os.remove(PENDING_FILE)
         if result:
             reply_text, in_tok, out_tok = result
