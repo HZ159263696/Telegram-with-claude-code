@@ -27,11 +27,11 @@ LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4000")
 ANTHROPIC_PROXY_URL = "http://localhost:4001"
 
 # Claude model provider detection
-_CLAUDE_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
+_CLAUDE_MODELS = {"claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
 # Non-Claude models need CLI alias for LiteLLM routing
 _CLI_MODEL_ALIAS = {
-    "deepseek-chat":     "claude-3-5-sonnet-20241022",
-    "deepseek-reasoner": "claude-3-opus-20240229",
+    "deepseek-v4-flash": "claude-3-5-sonnet-20241022",
+    "deepseek-v4-pro":   "claude-3-opus-20240229",
     "glm-4-plus":        "claude-3-sonnet-20240229",
     "glm-4-flash":       "claude-3-haiku-20240307",
     "abab6.5s-chat":     "claude-3-5-haiku-20241022",
@@ -39,6 +39,61 @@ _CLI_MODEL_ALIAS = {
     "qwen-plus":         "claude-3-opus-latest",
     "qwen-turbo":        "claude-3-haiku-20240307",
 }
+
+# 厂商原生 Anthropic 端点（直连，跳过本地代理）
+_NATIVE_ANTHROPIC_BASE = {
+    "deepseek-v4-flash": "https://api.deepseek.com/anthropic",
+    "deepseek-v4-pro":   "https://api.deepseek.com/anthropic",
+}
+
+
+def _get_provider_key(model):
+    """从 telegram_api_keys.json 读取该模型对应厂商的 API key"""
+    if not os.path.exists(API_KEYS_FILE):
+        return ""
+    try:
+        keys = json.load(open(API_KEYS_FILE))
+    except Exception:
+        return ""
+    if model.startswith("deepseek"):
+        return keys.get("deepseek", "")
+    if model.startswith("glm"):
+        return keys.get("zhipu", "")
+    if model.startswith("abab"):
+        return keys.get("minimax", "")
+    if model.startswith("qwen"):
+        return keys.get("bailian", "")
+    return ""
+
+CLAUDE_JSON_PATH = os.path.expanduser("~/.claude.json")
+
+
+def _approve_custom_key(api_key):
+    """预写 ~/.claude.json 让 Claude CLI 不再弹自定义 key 确认提示。"""
+    if not api_key or len(api_key) < 20:
+        return
+    suffix = api_key[-20:]
+    try:
+        cfg = json.load(open(CLAUDE_JSON_PATH))
+    except Exception:
+        return
+    resp = cfg.setdefault("customApiKeyResponses", {})
+    approved = resp.setdefault("approved", [])
+    rejected = resp.setdefault("rejected", [])
+    changed = False
+    if suffix in rejected:
+        rejected.remove(suffix)
+        changed = True
+    if suffix not in approved:
+        approved.append(suffix)
+        changed = True
+    if changed:
+        try:
+            with open(CLAUDE_JSON_PATH, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
 
 def _relaunch_claude(model):
     """Relaunch Claude Code in tmux with the correct model/provider."""
@@ -65,7 +120,14 @@ def _relaunch_claude(model):
         # Start with correct model
         if model in _CLAUDE_MODELS:
             cmd = f"claude --dangerously-skip-permissions --model {model}"
+        elif model in _NATIVE_ANTHROPIC_BASE and _get_provider_key(model):
+            # 直连厂商原生 Anthropic 端点（如 DeepSeek V4）
+            base = _NATIVE_ANTHROPIC_BASE[model]
+            key = _get_provider_key(model)
+            _approve_custom_key(key)
+            cmd = f"ANTHROPIC_API_KEY={key} ANTHROPIC_BASE_URL={base} claude --dangerously-skip-permissions --model {model}"
         else:
+            _approve_custom_key("sk-placeholder")
             cli_model = _CLI_MODEL_ALIAS.get(model, model)
             cmd = f"ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL={ANTHROPIC_PROXY_URL} claude --dangerously-skip-permissions --model {cli_model}"
         subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"])
@@ -75,7 +137,8 @@ def _relaunch_claude(model):
 # ── Shared state ──────────────────────────────────────────────────────────────
 _bridge_proc       = None
 _bridge_start_time = None
-_log_buffer        = []
+_log_buffer        = []   # list of (seq, text)
+_log_seq           = 0    # monotonic counter
 _log_lock          = threading.Lock()
 _sse_queues        = []
 _sse_lock          = threading.Lock()
@@ -83,10 +146,166 @@ MAX_LOG_LINES      = 500
 
 
 def _log(line):
+    global _log_seq
     ts    = time.strftime("%H:%M:%S")
-    entry = f"[{ts}] {line.rstrip()}"
+    text  = f"[{ts}] {line.rstrip()}"
     with _log_lock:
+        _log_seq += 1
+        entry = (_log_seq, text)
         _log_buffer.append(entry)
+        if len(_log_buffer) > MAX_LOG_LINES:
+            _log_buffer.pop(0)
+    with _sse_lock:
+        for q in list(_sse_queues):
+            try:
+                q.put_nowait(text)
+            except queue.Full:
+                pass
+
+
+def _read_bridge_output(proc):
+    for raw in iter(proc.stdout.readline, b""):
+        _log(raw.decode(errors="replace"))
+
+
+# ── tmux capture for Claude Code live output ──────────────────────────────────
+_tmux_prev_snapshot = ""          # normalized full text of last capture
+_tmux_prev_norm_lines = []        # normalized lines of last capture
+_tmux_capture_running = False
+
+def _normalize_tmux(line):
+    """Strip all ANSI/OSC/control sequences and whitespace for reliable comparison."""
+    import re
+    # CSI sequences: \x1b[ ... letter
+    s = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line)
+    # OSC sequences: \x1b] ... (terminated by BEL or ST)
+    s = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", "", s)
+    # Other escape sequences: \x1b followed by one char
+    s = re.sub(r"\x1b.", "", s)
+    # Remaining control characters except newline/tab
+    s = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", s)
+    # Strip terminal block/cursor glyphs that vary per-render 去除光标块等重绘差异
+    s = re.sub(r"[\u2588\u2590\u258c▂▃▄▅▆▇]", "", s)
+    return s.strip()
+
+def _dedup_key(line):
+    """Aggressive key for dedup: collapse whitespace so trivial render diffs match.
+    用于去重的规范化 key：折叠所有空白，避免空格差异造成漏判。"""
+    import re
+    return re.sub(r"\s+", " ", line).strip()
+
+def _tmux_capture_loop():
+    """Background thread: capture tmux pane content and push new lines to SSE."""
+    global _tmux_prev_snapshot, _tmux_prev_norm_lines, _tmux_capture_running
+    _tmux_capture_running = True
+    while _tmux_capture_running:
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", TMUX_SESSION, "-p", "-S", "-50"],
+                capture_output=True, timeout=3
+            )
+            if result.returncode == 0:
+                raw_lines = result.stdout.decode(errors="replace").splitlines()
+                # Normalize each line for comparison
+                norm_lines = [_normalize_tmux(l) for l in raw_lines]
+                # Remove trailing empty lines
+                while norm_lines and not norm_lines[-1]:
+                    norm_lines.pop()
+                # Build snapshot string for quick full-compare
+                snapshot = "\n".join(norm_lines)
+                # If nothing changed at all, skip entirely
+                if snapshot == _tmux_prev_snapshot:
+                    _tmux_prev_norm_lines = norm_lines
+                    _tmux_prev_snapshot = snapshot
+                    continue
+                # Find new lines: match longest suffix of prev at start of cur
+                prev = _tmux_prev_norm_lines
+                new_start = 0
+                if prev:
+                    for i in range(len(prev), 0, -1):
+                        if norm_lines[:i] == prev[-i:]:
+                            new_start = i
+                            break
+                new_lines = norm_lines[new_start:]
+                for line in new_lines:
+                    if line:
+                        _log_claude(line)
+                _tmux_prev_norm_lines = norm_lines
+                _tmux_prev_snapshot = snapshot
+        except Exception:
+            pass
+        time.sleep(3)
+
+
+import re as _re
+# Spinner symbols used by Claude Code (✶✷✸✹✺✻✼✽✾✿❀❁ and others)
+_SPINNER_RE = _re.compile(r"^[✶✷✸✹✺✻✼✽✾✿❀❁·•◦⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]\s")
+
+def _should_skip_claude_line(line):
+    """Filter out noise: logo, spinners, prompts, decorative borders."""
+    s = line.strip()
+    if not s:
+        return True
+    # Bare prompt line (just ❯ with optional trailing space)
+    if s == "❯" or s == ">":
+        return True
+    # Spinner / thinking status lines (e.g. "✶ Gesticulating…", "· Finagling… (running stop hook)")
+    if _SPINNER_RE.match(s):
+        return True
+    # ASCII art logo characters (block elements)
+    if any(ch in s for ch in "▐▛▜▌▝▘█▞▚▖▗▙▟"):
+        return True
+    # bypass permissions prompt, auto-update noise
+    if "bypass permissions" in s or "Auto-update failed" in s:
+        return True
+    # esc to cancel prompt
+    if s.startswith("esc to") or s.startswith("⏵⏵"):
+        return True
+    # claude doctor suggestion
+    if "claude doctor" in s.lower():
+        return True
+    # Pure decorative lines
+    if all(c in " ─━═│┃┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬·•◦◈◇◆" for c in s):
+        return True
+    return False
+
+_logged_recent_set = set()     # O(1) lookup for dedup
+_logged_recent_list = []       # ordered list to evict oldest
+_last_log_time = 0             # 上一条日志时间戳，用于判断是否续行
+_BLOCK_LEADERS = ("●", "❯", "⎿", "✢", "✶", "✷", "✸", "✺", "⏺", "*", "·")  # 新消息块起始字符
+
+def _log_claude(line):
+    """Log a Claude Code output line with [Claude] prefix.
+    连续输出的续行（2秒内、且不是新块起始）只缩进不加时间戳前缀，避免把一段话切碎。"""
+    global _last_log_time
+    if _should_skip_claude_line(line):
+        return
+    # Deduplicate using whitespace-collapsed key to absorb re-render diffs
+    key = _dedup_key(line)
+    if not key:
+        return
+    if key in _logged_recent_set:
+        return
+    _logged_recent_set.add(key)
+    _logged_recent_list.append(key)
+    if len(_logged_recent_list) > 1000:
+        old = _logged_recent_list.pop(0)
+        _logged_recent_set.discard(old)
+    now = time.time()
+    stripped = line.lstrip()
+    # 判定是否为一个新逻辑块：超过2秒没输出，或行首是块起始字符
+    is_new_block = (now - _last_log_time > 2.0) or any(stripped.startswith(c) for c in _BLOCK_LEADERS)
+    if is_new_block:
+        ts = time.strftime("%H:%M:%S")
+        entry = f"[{ts}] [Claude] {line.rstrip()}"
+    else:
+        # 续行：用等宽空白对齐到前缀位置，读起来像一段
+        entry = f"                    {line.rstrip()}"
+    _last_log_time = now
+    with _log_lock:
+        global _log_seq
+        _log_seq += 1
+        _log_buffer.append((_log_seq, entry))
         if len(_log_buffer) > MAX_LOG_LINES:
             _log_buffer.pop(0)
     with _sse_lock:
@@ -95,11 +314,6 @@ def _log(line):
                 q.put_nowait(entry)
             except queue.Full:
                 pass
-
-
-def _read_bridge_output(proc):
-    for raw in iter(proc.stdout.readline, b""):
-        _log(raw.decode(errors="replace"))
 
 
 def start_bridge():
@@ -112,6 +326,12 @@ def start_bridge():
     subprocess.call(["fuser", "-k", f"{bridge_port}/tcp"], stderr=subprocess.DEVNULL)
     import time as _t; _t.sleep(0.5)  # wait for port to free
     env = os.environ.copy()
+    # Reset token stats on each bridge start
+    try:
+        with open(TOKEN_STATS_FILE, "w") as f:
+            json.dump({"input": 0, "output": 0}, f)
+    except Exception:
+        pass
     _bridge_proc = subprocess.Popen(
         [sys.executable, BRIDGE_SCRIPT],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -263,9 +483,7 @@ body::after{
   width:8px;height:8px;border-radius:50%;
   background:var(--accent);
   box-shadow:0 0 10px var(--accent);
-  animation:blink 2s ease-in-out infinite;
 }
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 .header h1{
   font-family:var(--font-display);
   font-size:17px;font-weight:700;
@@ -398,15 +616,27 @@ body::after{
 }
 .log-btn:hover{border-color:rgba(0,212,255,.3);color:var(--accent)}
 #log-output{
-  height:180px;overflow-y:auto;
+  height:300px;overflow-y:auto;scroll-behavior:smooth;
   font-size:11px;line-height:1.6;
   color:#4a6a90;
   scrollbar-width:thin;scrollbar-color:var(--border) transparent;
 }
 #log-output .ll{padding:0;color:#4a6a90}
-#log-output .ll:nth-child(odd){color:#3d5a7a}
-#log-output .ll.new{color:var(--text3);animation:fadein .3s ease}
-@keyframes fadein{from{opacity:0;color:var(--accent)}to{opacity:1;color:var(--text3)}}
+#log-output .ll.new{color:var(--text3)}
+#log-output .ll.claude{color:#e0a040;font-weight:500}
+
+/* ── Fullscreen log ── */
+.log-panel.fullscreen{
+  position:fixed;top:0;left:0;right:0;bottom:0;
+  max-width:100%;width:100%;height:100%;
+  margin:0;border-radius:0;z-index:9999;
+  padding:14px 16px;display:flex;flex-direction:column;
+}
+.log-panel.fullscreen #log-output{
+  height:auto;flex:1;
+  font-size:13px;line-height:1.7;
+}
+.log-panel.fullscreen .log-header{flex-shrink:0}
 
 /* ── Keys panel ── */
 details{max-width:480px;width:100%}
@@ -619,6 +849,7 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
     <div class="log-btns">
       <button class="log-btn" id="pauseBtn" onclick="togglePause()">⏸ 暂停</button>
       <button class="log-btn" onclick="clearLog()">清空</button>
+      <button class="log-btn" id="fullscreenBtn" onclick="toggleFullscreen()">全屏</button>
     </div>
   </div>
   <div id="log-output"></div>
@@ -658,11 +889,11 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
 
 <script>
 const MODELS=[
-  {id:"claude-opus-4-6",  name:"Claude Opus 4.6",    prov:"Anthropic", icon:"🟣", desc:"最强推理，复杂任务首选",  badge:"smart",  badgeTxt:"SMART"},
+  {id:"claude-opus-4-7",  name:"Claude Opus 4.7",    prov:"Anthropic", icon:"🟣", desc:"最强推理，复杂任务首选",  badge:"smart",  badgeTxt:"SMART"},
   {id:"claude-sonnet-4-6",name:"Claude Sonnet 4.6",  prov:"Anthropic", icon:"🔵", desc:"均衡性能，日常主力",      badge:"fast",   badgeTxt:"FAST"},
   {id:"claude-haiku-4-5-20251001",name:"Claude Haiku 4.5",prov:"Anthropic",icon:"⚪",desc:"超快响应，轻量任务",   badge:"cheap",  badgeTxt:"LITE"},
-  {id:"deepseek-chat",    name:"DeepSeek V3",         prov:"DeepSeek",  icon:"🐋", desc:"代码 & 推理强项",        badge:"smart",  badgeTxt:"CODE"},
-  {id:"deepseek-reasoner",name:"DeepSeek R1",         prov:"DeepSeek",  icon:"🧠", desc:"Chain-of-thought 推理",  badge:"reason", badgeTxt:"THINK"},
+  {id:"deepseek-v4-flash",name:"DeepSeek V4 Flash",   prov:"DeepSeek",  icon:"🐋", desc:"经济快速，1M 上下文",    badge:"fast",   badgeTxt:"FAST"},
+  {id:"deepseek-v4-pro",  name:"DeepSeek V4 Pro",     prov:"DeepSeek",  icon:"🧠", desc:"旗舰思考模式，1M 上下文",badge:"reason", badgeTxt:"THINK"},
   {id:"glm-4-plus",       name:"GLM-4 Plus",          prov:"ZhipuAI",   icon:"🌸", desc:"智谱旗舰，中文优化",     badge:"smart",  badgeTxt:"SMART"},
   {id:"glm-4-flash",      name:"GLM-4 Flash",         prov:"ZhipuAI",   icon:"⚡", desc:"闪电响应，低成本",       badge:"cheap",  badgeTxt:"FAST"},
   {id:"abab6.5s-chat",    name:"MiniMax 6.5s",        prov:"MiniMax",   icon:"🎭", desc:"多模态，长上下文",        badge:"smart",  badgeTxt:"MULTI"},
@@ -822,20 +1053,83 @@ async function loadKeys(){
     if(d.bailian) document.getElementById("k-bl").value=d.bailian;
   }catch(e){}
 }
-function startSSE(){
+let _sse=null;
+let _sseReconnect=null;
+let _sseFails=0;         // consecutive SSE failures
+let _pollTimer=null;     // polling fallback timer
+let _pollSeq=0;          // last seen log seq for polling
+let _usePolling=false;   // fallback mode flag
+
+function _appendLog(text,first){
   const logEl=document.getElementById("log-output");
+  if(paused)return;
+  const atBottom=(logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight)<40;
+  const div=document.createElement("div");
+  const isClaude=text.includes("] [Claude] ")||text.startsWith("                    ");
+  div.className="ll"+(first?"":" new")+(isClaude?" claude":"");
+  div.style.opacity="0";div.style.transition="opacity .5s ease";
+  div.textContent=text;
+  logEl.appendChild(div);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>div.style.opacity="1"));
+  while(logEl.children.length>300){
+    const removed=logEl.firstChild;
+    const h=removed.offsetHeight;
+    logEl.removeChild(removed);
+    if(!atBottom)logEl.scrollTop=Math.max(0,logEl.scrollTop-h);
+  }
+  if(atBottom)logEl.scrollTop=logEl.scrollHeight;
+}
+
+function startPolling(){
+  if(_pollTimer)return;
+  _usePolling=true;
+  toast("SSE不可用，已切换轮询模式");
+  function poll(){
+    fetch("/api/logs/snapshot?since="+_pollSeq)
+      .then(r=>r.json())
+      .then(d=>{
+        if(d.lines&&d.lines.length>0){
+          d.lines.forEach(t=>_appendLog(t,false));
+        }
+        if(d.seq)_pollSeq=d.seq;
+      }).catch(()=>{});
+    _pollTimer=setTimeout(poll,2000);
+  }
+  poll();
+}
+
+function startSSE(){
+  if(_usePolling){startPolling();return;}
+  if(_sse){try{_sse.close();}catch(e){}_sse=null;}
+  if(_sseReconnect){clearTimeout(_sseReconnect);_sseReconnect=null;}
   const es=new EventSource("/api/logs");
+  _sse=es;
   let first=true;
   es.onmessage=(e)=>{
-    if(paused)return;
-    const div=document.createElement("div");
-    div.className="ll"+(first?"":" new");first=false;
-    div.textContent=e.data;
-    logEl.appendChild(div);
-    while(logEl.children.length>300)logEl.removeChild(logEl.firstChild);
-    logEl.scrollTop=logEl.scrollHeight;
+    if(es!==_sse)return;
+    _sseFails=0;
+    _appendLog(e.data,first);first=false;
   };
-  es.onerror=()=>setTimeout(startSSE,3000);
+  es.onerror=()=>{
+    if(es!==_sse)return;
+    try{es.close();}catch(e){}
+    _sse=null;
+    _sseFails++;
+    if(_sseFails>=3){
+      startPolling();
+    }else{
+      _sseReconnect=setTimeout(startSSE,3000);
+    }
+  };
+}
+function toggleFullscreen(){
+  const panel=document.querySelector(".log-panel");
+  const btn=document.getElementById("fullscreenBtn");
+  panel.classList.toggle("fullscreen");
+  const isFull=panel.classList.contains("fullscreen");
+  btn.textContent=isFull?"退出全屏":"全屏";
+  const logEl=document.getElementById("log-output");
+  logEl.scrollTop=logEl.scrollHeight;
 }
 function togglePause(){
   paused=!paused;
@@ -861,6 +1155,8 @@ setInterval(fetchStatus,3000);
 # ── HTTP Handler ──────────────────────────────────────────────────────────────
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def do_GET(self):
         path = urlparse(self.path).path
 
@@ -873,11 +1169,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/logs":
             self._sse_stream()
 
+        elif path == "/api/logs/snapshot":
+            # Polling fallback: ?since=<seq> returns new lines with seq > since
+            from urllib.parse import parse_qs, urlparse as _up
+            qs = parse_qs(_up(self.path).query)
+            try:
+                since = int(qs.get("since", ["0"])[0])
+            except Exception:
+                since = 0
+            with _log_lock:
+                new = [(seq, text) for seq, text in _log_buffer if seq > since]
+                new = new[-50:]
+                max_seq = _log_buffer[-1][0] if _log_buffer else 0
+            self._json({"lines": [text for _, text in new], "seq": max_seq})
+
         elif path == "/api/keys":
             self._json(get_api_keys())
 
         else:
             self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
     def do_POST(self):
@@ -941,12 +1252,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
         q = queue.Queue(maxsize=200)
         # Flush last 50 buffered lines first
         with _log_lock:
-            lines = list(_log_buffer[-50:])
+            lines = [text for _, text in _log_buffer[-50:]]
         for line in lines:
             try:
                 self.wfile.write(f"data: {line}\n\n".encode())
@@ -993,11 +1305,15 @@ def main():
         print("⚠  TELEGRAM_BOT_TOKEN not set — bridge won't start without it")
     else:
         start_bridge()  # auto-start bridge on dashboard launch
+    # Start tmux capture thread for Claude Code live output
+    threading.Thread(target=_tmux_capture_loop, daemon=True).start()
     print(f"Dashboard → http://localhost:{DASHBOARD_PORT}")
     print(f"Bridge script: {BRIDGE_SCRIPT}")
     try:
         ThreadingDashboard(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever()
     except KeyboardInterrupt:
+        global _tmux_capture_running
+        _tmux_capture_running = False
         stop_bridge()
         print("\nStopped")
 

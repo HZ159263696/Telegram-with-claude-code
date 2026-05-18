@@ -17,6 +17,9 @@ fi
 pkill -f "python3 bridge.py" 2>/dev/null; sleep 0.5
 fuser -k ${PORT}/tcp 2>/dev/null; sleep 0.3
 
+# 清除上次 session 的通知标记，本次启动允许发一次
+rm -f /tmp/dashboard_notified_session.flag
+
 # If already running inside tmux, just do the work directly
 if [ -n "$TMUX" ]; then
     # ── running inside tmux pane ──────────────────────────────────────
@@ -51,16 +54,16 @@ if [ -n "$TMUX" ]; then
     echo "[1] Starting tmux session 'claude'..."
     tmux kill-session -t claude 2>/dev/null || true
 
-    # Read saved model preference (default: claude-opus-4-6)
+    # Read saved model preference (default: claude-opus-4-7)
     MODEL_FILE="$HOME/.claude/telegram_model"
-    SAVED_MODEL="claude-opus-4-6"
+    SAVED_MODEL="claude-opus-4-7"
     if [ -f "$MODEL_FILE" ]; then
         SAVED_MODEL=$(cat "$MODEL_FILE" | tr -d '[:space:]')
-        [ -z "$SAVED_MODEL" ] && SAVED_MODEL="claude-opus-4-6"
+        [ -z "$SAVED_MODEL" ] && SAVED_MODEL="claude-opus-4-7"
     fi
 
     # Determine if model needs LiteLLM proxy
-    CLAUDE_MODELS="claude-opus-4-6 claude-sonnet-4-6 claude-haiku-4-5-20251001"
+    CLAUDE_MODELS="claude-opus-4-7 claude-sonnet-4-6 claude-haiku-4-5-20251001"
     IS_CLAUDE=false
     for cm in $CLAUDE_MODELS; do
         [ "$SAVED_MODEL" = "$cm" ] && IS_CLAUDE=true
@@ -84,37 +87,56 @@ if [ -n "$TMUX" ]; then
     fi
     echo "    tmux session 'claude' started (model: $SAVED_MODEL)."
 
-    # 2. Start localtunnel
-    echo "[2] Starting tunnel via localtunnel..."
-    LTLOG=/tmp/lt_bridge.log
+    # 2. Start ngrok tunnel with auto-reconnect / 启动 ngrok 隧道（自动重连）
+    # 用 ngrok 而不是 cloudflared/localtunnel: Telegram DNS 对 trycloudflare/loca.lt 不稳定，会拒绝解析
+    echo "[2] Starting tunnel via ngrok (with auto-reconnect)..."
+    pkill -f "ngrok http $PORT" 2>/dev/null; sleep 0.5
 
-    if ! npx --yes lt --version &>/dev/null 2>&1; then
-        echo "    Installing localtunnel..."
-        npm install -g localtunnel 2>/dev/null
-    fi
+    (
+        while true; do
+            SLOG=/tmp/lt_bridge.log
+            > "$SLOG"
+            # ngrok 免费版不支持代理，启动前 unset 所有 proxy 环境变量
+            env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+                ngrok http $PORT --log stdout --log-format=logfmt > "$SLOG" 2>&1 &
+            LT_PID=$!
 
-    npx lt --port $PORT > $LTLOG 2>&1 &
-    echo "    Waiting for tunnel URL..."
-    for i in $(seq 1 20); do
-        URL=$(grep -o 'https://[^[:space:]]*.loca.lt' $LTLOG 2>/dev/null | head -1)
-        [ -n "$URL" ] && break
-        sleep 1
-    done
+            # Wait for URL / 等待 URL 出现（通过本地 API 4040 拿，避免 stdout 缓冲）
+            URL=""
+            for i in $(seq 1 30); do
+                URL=$(curl -s --noproxy '*' http://127.0.0.1:4040/api/tunnels 2>/dev/null \
+                    | grep -oE '"public_url":"https://[^"]+"' | head -1 | sed 's/"public_url":"//;s/"$//')
+                [ -n "$URL" ] && break
+                sleep 1
+            done
 
-    if [ -n "$URL" ]; then
-        echo "    Public URL: $URL"
-        echo "[3] Registering Telegram webhook..."
-        RESULT=$(curl -s "https://api.telegram.org/bot${TOKEN}/setWebhook" \
-            -d "url=$URL" 2>/dev/null)
-        if echo "$RESULT" | grep -q '"ok":true'; then
-            echo "    Webhook registered OK"
-        else
-            echo "    Webhook failed: $RESULT"
-        fi
-    else
-        echo "    WARNING: Could not get tunnel URL."
-        echo "    Try manually: npx lt --port 8080"
-    fi
+            if [ -n "$URL" ]; then
+                echo "    Public URL: $URL"
+                echo "    Registering Telegram webhook..."
+                # cloudflared trycloudflare 子域名 DNS 需要几秒到几十秒传播，所以失败重试
+                for attempt in 1 2 3 4 5 6 7 8 9 10; do
+                    RESULT=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/setWebhook" \
+                        -d "url=$URL" -d "drop_pending_updates=true" 2>/dev/null)
+                    if echo "$RESULT" | grep -q '"ok":true'; then
+                        echo "    Webhook registered OK (attempt $attempt)"
+                        break
+                    fi
+                    echo "    Webhook attempt $attempt failed: $RESULT"
+                    sleep 6
+                done
+            else
+                echo "    WARNING: Could not get tunnel URL, retrying in 5s..."
+                kill $LT_PID 2>/dev/null
+            fi
+
+            # Wait for lt to exit (crash), then auto-restart / 等 lt 断开后重连
+            wait $LT_PID 2>/dev/null
+            echo "    Bridge tunnel crashed, reconnecting in 5s..."
+            sleep 5
+        done
+    ) &
+    BRIDGE_TUNNEL_PID=$!
+    echo "    Bridge tunnel manager started (pid: $BRIDGE_TUNNEL_PID)"
 
     # 3. Start dashboard (web UI on port 8888)
     echo "[4] Starting dashboard on port 8888..."
@@ -122,6 +144,65 @@ if [ -n "$TMUX" ]; then
     fuser -k 8888/tcp 2>/dev/null; sleep 0.3
     nohup env TELEGRAM_BOT_TOKEN="$TOKEN" DASHBOARD_PORT=8888 python3 "$PROJECT/dashboard.py" > /tmp/dashboard.log 2>&1 &
     echo "    Dashboard started (log: /tmp/dashboard.log)"
+
+    # 3.5. Start cloudflared tunnel for dashboard (mobile access) with auto-reconnect
+    echo "[4.5] Starting tunnel for dashboard (with auto-reconnect)..."
+    pkill -f "cloudflared tunnel --url http://localhost:8888" 2>/dev/null; sleep 0.5
+    DASH_NOTIFIED=false
+    (
+        while true; do
+            DASH_SLOG=/tmp/lt_dashboard.log
+            > "$DASH_SLOG"
+            env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+                cloudflared tunnel --url http://localhost:8888 --protocol http2 --retries 10 > "$DASH_SLOG" 2>&1 &
+            LT_PID=$!
+
+            # Wait for URL / 等待 URL 出现
+            DASH_URL=""
+            for i in $(seq 1 30); do
+                DASH_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$DASH_SLOG" 2>/dev/null | head -1)
+                [ -n "$DASH_URL" ] && break
+                sleep 1
+            done
+
+            if [ -n "$DASH_URL" ]; then
+                echo "    Dashboard public URL: $DASH_URL"
+                echo "$DASH_URL" > /tmp/dashboard_url.txt
+                # 仅在本次启动首次获取到 URL 时通知，重连不再重复发送
+                if [ ! -f /tmp/dashboard_notified_session.flag ]; then
+                    CHAT_ID=""
+                    [ -f "$HOME/.claude/telegram_chat_id" ] && CHAT_ID=$(cat "$HOME/.claude/telegram_chat_id" | tr -d '[:space:]')
+                    if [ -n "$CHAT_ID" ]; then
+                        curl -s "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+                            -d "chat_id=$CHAT_ID" \
+                            -d "parse_mode=HTML" \
+                            -d "text=📊 <b>Dashboard 已上线</b>%0A%0A<a href=\"$DASH_URL\">点击打开控制面板</a>%0A%0A实时查看 Claude Code 工作进度、日志、模型切换" \
+                            > /dev/null 2>&1
+                        echo "    Dashboard URL sent to Telegram"
+                        touch /tmp/dashboard_notified_session.flag
+                    fi
+                else
+                    echo "    Dashboard tunnel reconnected, skip duplicate notify"
+                fi
+            else
+                echo "    WARNING: Could not get dashboard tunnel URL, retrying in 5s..."
+                kill $LT_PID 2>/dev/null
+            fi
+
+            # Wait for lt to exit (crash), then auto-restart / 等 lt 断开后重连
+            wait $LT_PID 2>/dev/null
+            echo "    Dashboard tunnel crashed, reconnecting in 5s..."
+            sleep 5
+        done
+    ) &
+    DASH_TUNNEL_PID=$!
+    echo "    Dashboard tunnel manager started (pid: $DASH_TUNNEL_PID)"
+
+    # 5. Start Feishu bridge (long-connection WebSocket)
+    echo "[6] Starting Feishu bridge..."
+    pkill -f "feishu_bridge.py" 2>/dev/null; sleep 0.3
+    nohup python3 "$PROJECT/feishu_bridge.py" > /tmp/feishu_bridge.log 2>&1 &
+    echo "    Feishu bridge started (log: /tmp/feishu_bridge.log)"
 
     # 4. Bridge is managed by dashboard (auto-start on dashboard launch)
     echo "[5] Bridge managed by dashboard on port $PORT."
