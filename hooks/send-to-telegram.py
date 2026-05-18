@@ -3,9 +3,33 @@
 import sys, os, json, re, time, urllib.request
 
 LOG = "/tmp/hook_debug.log"
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "REDACTED_TELEGRAM_TOKEN")
-CHAT_ID_FILE = os.path.expanduser("~/.claude/telegram_chat_id")
-PENDING_FILE = os.path.expanduser("~/.claude/telegram_pending")
+TOKEN_STATS_FILE = os.path.expanduser("~/.claude/telegram_token_stats.json")
+
+# ── Bot 路由表：根据 Claude Code 工作区路径判断用哪个 Bot ──────────────────────
+# key = 工作区路径关键词（在 transcript_path 中匹配）
+# value = (bot_token, pending_file, chat_id_file)
+BOT_ROUTES = [
+    (
+        "cao-stock",   # 股票工作区特征（Claude Code把路径下划线转为连字符）
+        os.environ.get("STOCK_BOT_TOKEN", "REDACTED_TELEGRAM_TOKEN"),
+        os.path.expanduser("~/.claude/telegram_pending_stock"),
+        os.path.expanduser("~/.claude/telegram_chat_id_stock"),
+    ),
+    # 主控Bot（兜底）
+    (
+        "",
+        os.environ.get("TELEGRAM_BOT_TOKEN", "REDACTED_TELEGRAM_TOKEN"),
+        os.path.expanduser("~/.claude/telegram_pending"),
+        os.path.expanduser("~/.claude/telegram_chat_id"),
+    ),
+]
+
+def resolve_bot(transcript_path):
+    """Return (token, pending_file, chat_id_file) based on transcript path."""
+    for keyword, token, pending, chat_id in BOT_ROUTES:
+        if not keyword or keyword in transcript_path:
+            return token, pending, chat_id
+    return BOT_ROUTES[-1][1], BOT_ROUTES[-1][2], BOT_ROUTES[-1][3]
 
 def log(msg):
     with open(LOG, "a") as f:
@@ -22,6 +46,10 @@ def main():
 
     transcript_path = data.get("transcript_path", "")
     log(f"hook start: transcript={transcript_path}")
+
+    # Resolve which bot should reply based on transcript path
+    TOKEN, PENDING_FILE, CHAT_ID_FILE = resolve_bot(transcript_path)
+    log(f"resolved bot: token=...{TOKEN[-10:]} pending={PENDING_FILE}")
 
     # Check pending file
     if not os.path.exists(PENDING_FILE):
@@ -69,8 +97,9 @@ def main():
         log("no user message found")
         return
 
-    # Collect assistant text after last user message
+    # Collect assistant text and token usage after last user message
     texts = []
+    total_in, total_out = 0, 0
     for line in lines[last_user_idx + 1:]:
         try:
             obj = json.loads(line)
@@ -78,6 +107,10 @@ def main():
                 for block in obj["message"].get("content", []):
                     if block.get("type") == "text":
                         texts.append(block["text"])
+                usage = obj["message"].get("usage", {})
+                if usage:
+                    total_in += usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+                    total_out += usage.get("output_tokens", 0)
         except:
             continue
 
@@ -108,30 +141,57 @@ def main():
     for i, code in enumerate(inlines_saved):
         text = text.replace(f"\x00I{i}\x00", f'<code>{esc(code)}</code>')
 
-    # Send to Telegram
+    # Send to Telegram, retry on SSL/transient network errors
     def send(txt, mode=None):
         payload = {"chat_id": chat_id, "text": txt}
         if mode:
             payload["parse_mode"] = mode
-        try:
-            req = urllib.request.Request(
-                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                json.dumps(payload).encode(),
-                {"Content-Type": "application/json"}
-            )
-            resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
-            log(f"send ok={resp.get('ok')} mode={mode}")
-            return resp.get("ok")
-        except Exception as e:
-            log(f"send FAILED mode={mode} error={e}")
-            return False
+        body = json.dumps(payload).encode()
+        last_err = None
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(
+                    f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                    body, {"Content-Type": "application/json"}
+                )
+                resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+                log(f"send ok={resp.get('ok')} mode={mode} attempt={attempt+1}")
+                return resp.get("ok")
+            except urllib.error.HTTPError as e:
+                # 4xx 不重试（比如 parse_mode 错误）
+                log(f"send HTTP {e.code} mode={mode} attempt={attempt+1}: {e.read()[:200]}")
+                return False
+            except Exception as e:
+                last_err = e
+                log(f"send error mode={mode} attempt={attempt+1}: {e}")
+                time.sleep(0.8 * (attempt + 1))  # 0.8s, 1.6s 退避
+        log(f"send FAILED after 3 attempts: {last_err}")
+        return False
 
     if not send(text, "HTML"):
         log("HTML failed, trying plain text")
         send("\n\n".join(texts).strip()[:4096])
 
+    # Update token stats for Claude model
+    if total_in > 0 or total_out > 0:
+        try:
+            stats = {"input": 0, "output": 0}
+            if os.path.exists(TOKEN_STATS_FILE):
+                stats = json.load(open(TOKEN_STATS_FILE))
+            stats["input"] = stats.get("input", 0) + total_in
+            stats["output"] = stats.get("output", 0) + total_out
+            with open(TOKEN_STATS_FILE, "w") as f:
+                json.dump(stats, f)
+            log(f"token stats updated: in={total_in} out={total_out}")
+        except Exception as e:
+            log(f"token stats error: {e}")
+
     os.remove(PENDING_FILE)
     log("done")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log(f"hook crashed: {e}")
+        sys.exit(0)
