@@ -1225,14 +1225,28 @@ function startSSE(){
   const es=new EventSource("/api/logs?bot="+curBot+"&since="+_sseSeq);
   _sse=es;
   let first=(_sseSeq===0);
+  // 10s timeout: if Cloudflare/proxy buffers SSE, fall back to polling
+  let aliveTimer=setTimeout(()=>{
+    if(es===_sse&&_sseFails<5){
+      _sseFails=5;
+      try{es.close();}catch(e){}
+      _sse=null;
+      startPolling();
+    }
+  },10000);
+  function resetAlive(){clearTimeout(aliveTimer);}
   es.onmessage=(e)=>{
     if(es!==_sse)return;
-    _sseFails=0;
-    // track seq from prefixed lines "seq:<n> text" — server sends plain text, use _pollSeq trick
+    resetAlive();_sseFails=0;
     _appendLog(e.data,first);first=false;
   };
+  es.addEventListener("ping",()=>{
+    if(es!==_sse)return;
+    resetAlive();_sseFails=0;
+  });
   es.onerror=()=>{
     if(es!==_sse)return;
+    resetAlive();
     try{es.close();}catch(e){}
     _sse=null;
     _sseFails++;
@@ -1419,6 +1433,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if bot_key not in BOTS:
             bot_key = "main"
 
+        # 2KB padding comment to break Cloudflare/proxy buffer
+        try:
+            padding = ": " + ("x" * 2046) + "\n\n"
+            self.wfile.write(padding.encode())
+            self.wfile.flush()
+        except Exception:
+            return
+
         q = queue.Queue(maxsize=500)
         # Replay buffered lines: if since>0 replay only missed lines, else last 200
         with _log_lock:
@@ -1447,7 +1469,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self.wfile.write(f"data: {line}\n\n".encode())
                     self.wfile.flush()
                 except queue.Empty:
-                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.write(b"event: ping\ndata: \n\n")
                     self.wfile.flush()
         except Exception:
             pass
