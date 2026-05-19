@@ -346,12 +346,13 @@ def setup_bot_commands():
 
 def send_typing_loop(chat_id, token=None, pending_file=None):
     pf = pending_file or PENDING_FILE
-    start = time.time()
     while os.path.exists(pf):
-        if time.time() - start > 300:
-            if os.path.exists(pf):
-                os.remove(pf)
-            return
+        # Heartbeat: refresh timestamp so stop hook never sees a stale pending file
+        try:
+            with open(pf, "w") as f:
+                f.write(str(int(time.time())))
+        except Exception:
+            pass
         telegram_api("sendChatAction", {"chat_id": chat_id, "action": "typing"}, token=token)
         time.sleep(4)
 
