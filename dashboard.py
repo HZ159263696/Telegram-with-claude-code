@@ -1173,6 +1173,7 @@ let _sseReconnect=null;
 let _sseFails=0;         // consecutive SSE failures
 let _pollTimer=null;     // polling fallback timer
 let _pollSeq=0;          // last seen log seq for polling
+let _sseSeq=0;           // last seen seq from SSE (for resume-after-reconnect)
 let _usePolling=false;   // fallback mode flag
 
 function _appendLog(text,first){
@@ -1186,7 +1187,7 @@ function _appendLog(text,first){
   div.textContent=text;
   logEl.appendChild(div);
   requestAnimationFrame(()=>requestAnimationFrame(()=>div.style.opacity="1"));
-  while(logEl.children.length>300){
+  while(logEl.children.length>500){
     const removed=logEl.firstChild;
     const h=removed.offsetHeight;
     logEl.removeChild(removed);
@@ -1195,11 +1196,16 @@ function _appendLog(text,first){
   if(atBottom)logEl.scrollTop=logEl.scrollHeight;
 }
 
+function stopPolling(){
+  if(_pollTimer){clearTimeout(_pollTimer);_pollTimer=null;}
+}
+
 function startPolling(){
-  if(_pollTimer)return;
+  stopPolling();
   _usePolling=true;
   toast("SSE不可用，已切换轮询模式");
   function poll(){
+    _pollTimer=null;
     fetch("/api/logs/snapshot?bot="+curBot+"&since="+_pollSeq)
       .then(r=>r.json())
       .then(d=>{
@@ -1207,22 +1213,22 @@ function startPolling(){
           d.lines.forEach(t=>_appendLog(t,false));
         }
         if(d.seq)_pollSeq=d.seq;
-      }).catch(()=>{});
-    _pollTimer=setTimeout(poll,2000);
+        _pollTimer=setTimeout(poll,2000);
+      }).catch(()=>{ _pollTimer=setTimeout(poll,3000); });
   }
   poll();
 }
 
 function startSSE(){
-  if(_usePolling){startPolling();return;}
   if(_sse){try{_sse.close();}catch(e){}_sse=null;}
   if(_sseReconnect){clearTimeout(_sseReconnect);_sseReconnect=null;}
-  const es=new EventSource("/api/logs?bot="+curBot);
+  const es=new EventSource("/api/logs?bot="+curBot+"&since="+_sseSeq);
   _sse=es;
-  let first=true;
+  let first=(_sseSeq===0);
   es.onmessage=(e)=>{
     if(es!==_sse)return;
     _sseFails=0;
+    // track seq from prefixed lines "seq:<n> text" — server sends plain text, use _pollSeq trick
     _appendLog(e.data,first);first=false;
   };
   es.onerror=()=>{
@@ -1230,13 +1236,31 @@ function startSSE(){
     try{es.close();}catch(e){}
     _sse=null;
     _sseFails++;
-    if(_sseFails>=3){
+    if(_sseFails>=5){
       startPolling();
     }else{
       _sseReconnect=setTimeout(startSSE,3000);
     }
   };
 }
+
+// 页面重新可见时重置并重连，保证实时日志不中断
+document.addEventListener("visibilitychange",()=>{
+  if(!document.hidden){
+    _sseFails=0;
+    if(_usePolling){
+      // 从轮询切回 SSE
+      stopPolling();
+      _usePolling=false;
+      _sseSeq=_pollSeq;  // 继续从上次轮询到的位置接
+      startSSE();
+      toast("已重新连接实时日志");
+    } else if(!_sse){
+      startSSE();
+    }
+  }
+});
+
 function toggleFullscreen(){
   const panel=document.querySelector(".log-panel");
   const btn=document.getElementById("fullscreenBtn");
@@ -1377,6 +1401,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _sse_stream(self, bot_key="main"):
+        from urllib.parse import parse_qs, urlparse as _up
+        qs = parse_qs(_up(self.path).query)
+        try:
+            since = int(qs.get("since", ["0"])[0])
+        except Exception:
+            since = 0
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -1388,10 +1419,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if bot_key not in BOTS:
             bot_key = "main"
 
-        q = queue.Queue(maxsize=200)
-        # Flush last 50 buffered lines first
+        q = queue.Queue(maxsize=500)
+        # Replay buffered lines: if since>0 replay only missed lines, else last 200
         with _log_lock:
-            lines = [text for _, text in _log_buffers[bot_key][-50:]]
+            buf = _log_buffers[bot_key]
+            if since > 0:
+                lines = [text for seq, text in buf if seq > since]
+            else:
+                lines = [text for _, text in buf[-200:]]
         for line in lines:
             try:
                 self.wfile.write(f"data: {line}\n\n".encode())
