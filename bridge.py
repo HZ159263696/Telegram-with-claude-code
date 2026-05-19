@@ -344,12 +344,13 @@ def setup_bot_commands():
         print("Bot commands registered")
 
 
-def send_typing_loop(chat_id, token=None):
+def send_typing_loop(chat_id, token=None, pending_file=None):
+    pf = pending_file or PENDING_FILE
     start = time.time()
-    while os.path.exists(PENDING_FILE):
+    while os.path.exists(pf):
         if time.time() - start > 300:
-            if os.path.exists(PENDING_FILE):
-                os.remove(PENDING_FILE)
+            if os.path.exists(pf):
+                os.remove(pf)
             return
         telegram_api("sendChatAction", {"chat_id": chat_id, "action": "typing"}, token=token)
         time.sleep(4)
@@ -602,13 +603,16 @@ class Handler(BaseHTTPRequestHandler):
             "xlsx", "xls", "xlsm", "csv",
             "pdf", "txt"
         }
+        _chat_id_file = self.profile.get("chat_id_file", CHAT_ID_FILE)
+        _pending_file = self.profile.get("pending_file", PENDING_FILE)
+
         if document:
             filename = document.get("file_name", f"file_{int(time.time())}")
             ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
             if ext not in SUPPORTED_EXTS:
                 self.reply(chat_id, f"不支持的文件类型：.{ext}")
                 return
-            with open(CHAT_ID_FILE, "w") as f:
+            with open(_chat_id_file, "w") as f:
                 f.write(str(chat_id))
             local_path = self.download_file(document.get("file_id"), filename)
             if not local_path:
@@ -618,7 +622,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # Photo message
         if photo:
-            with open(CHAT_ID_FILE, "w") as f:
+            with open(_chat_id_file, "w") as f:
                 f.write(str(chat_id))
             local_path = self.download_photo(photo)
             if not local_path:
@@ -629,7 +633,7 @@ class Handler(BaseHTTPRequestHandler):
         if not text or not chat_id:
             return
 
-        with open(CHAT_ID_FILE, "w") as f:
+        with open(_chat_id_file, "w") as f:
             f.write(str(chat_id))
 
         if text.startswith("/"):
@@ -681,9 +685,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 prompt = parts[1].replace('"', '\\"')
                 full = f'{prompt} Output <promise>DONE</promise> when complete.'
-                with open(PENDING_FILE, "w") as f:
+                with open(_pending_file, "w") as f:
                     f.write(str(int(time.time())))
-                threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token), daemon=True).start()
+                threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token, _pending_file), daemon=True).start()
                 tmux_send(f'/ralph-loop:ralph-loop "{full}" --max-iterations 5 --completion-promise "DONE"')
                 time.sleep(0.3)
                 tmux_send_enter()
@@ -819,7 +823,7 @@ class Handler(BaseHTTPRequestHandler):
         with open(pending_file, "w") as f:
             f.write(str(int(time.time())))
 
-        threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token), daemon=True).start()
+        threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token, pending_file), daemon=True).start()
 
         if tmux_exists(tmux_sess):
             tmux_send_with_enter(text, session=tmux_sess)
@@ -843,9 +847,10 @@ class Handler(BaseHTTPRequestHandler):
         sys_prompt = self.profile.get("system_prompt") or global_ctx
         messages = ([{"role": "system", "content": sys_prompt}] if sys_prompt else []) + list(history)
         result = call_direct_api(provider, model, messages)
-        # Only remove PENDING_FILE for tmux-routed bots (direct_api bots never set it)
-        if not self.profile.get("direct_api") and os.path.exists(PENDING_FILE):
-            os.remove(PENDING_FILE)
+        # Only remove pending file for tmux-routed bots (direct_api bots never set it)
+        pf = self.profile.get("pending_file", PENDING_FILE)
+        if not self.profile.get("direct_api") and os.path.exists(pf):
+            os.remove(pf)
         if result:
             reply_text, in_tok, out_tok = result
             history.append({"role": "assistant", "content": reply_text})
@@ -875,15 +880,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _stock_trigger_analysis(self, chat_id, code):
         """触发 Claude Code 对该股票进行完整技术分析"""
-        if not tmux_exists():
+        sess = self.profile.get("tmux_session", TMUX_SESSION)
+        pf   = self.profile.get("pending_file", PENDING_FILE)
+        if not tmux_exists(sess):
             self.reply(chat_id, "tmux session not found")
             return
         self.reply(chat_id, f"🔍 正在让 Claude 分析 {code}...")
-        with open(PENDING_FILE, "w") as f:
+        with open(pf, "w") as f:
             f.write(str(int(time.time())))
-        threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token), daemon=True).start()
+        threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token, pf), daemon=True).start()
         prompt = f"帮我分析股票 {code} 的当前走势，包括均线、MACD、RSI、KDJ，给出操作建议"
-        tmux_send_with_enter(prompt)
+        tmux_send_with_enter(prompt, session=sess)
 
     def _relaunch_claude_for_model(self, chat_id, model, provider):
         """Exit and relaunch THIS bot's Claude session with the new model.
