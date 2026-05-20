@@ -999,11 +999,12 @@ const MODELS=[
   {id:"qwen-plus",        name:"通义千问 Plus",        prov:"Bailian",   icon:"🌤", desc:"性价比之选",             badge:"cheap",  badgeTxt:"FAST"},
 ];
 
-let paused=false,isRunning=false,curModel="claude-sonnet-4-6",curBot="main";
+let paused=false,isRunning=false,curModel="claude-sonnet-4-6",curBot=(localStorage.getItem("dash_curBot")==="stock"?"stock":"main");
 
 function switchBot(bot){
   if(bot===curBot)return;
   curBot=bot;
+  try{localStorage.setItem("dash_curBot",bot);}catch(e){}
   document.querySelectorAll(".bot-tab").forEach(el=>{
     el.classList.toggle("active",el.dataset.bot===bot);
   });
@@ -1225,7 +1226,7 @@ function startSSE(){
   const es=new EventSource("/api/logs?bot="+curBot+"&since="+_sseSeq);
   _sse=es;
   let first=(_sseSeq===0);
-  // 10s timeout: if Cloudflare/proxy buffers SSE, fall back to polling
+  // 3s timeout: if Cloudflare/proxy buffers SSE, fall back to polling fast
   let aliveTimer=setTimeout(()=>{
     if(es===_sse&&_sseFails<5){
       _sseFails=5;
@@ -1233,7 +1234,7 @@ function startSSE(){
       _sse=null;
       startPolling();
     }
-  },10000);
+  },3000);
   function resetAlive(){clearTimeout(aliveTimer);}
   es.onmessage=(e)=>{
     if(es!==_sse)return;
@@ -1298,7 +1299,20 @@ function toast(msg){
 // Init
 const initM=MODELS.find(x=>x.id===curModel);
 if(initM)updateTrigger(initM);
-fetchStatus();loadKeys();startSSE();
+// 刷新后恢复上次选中的 Bot 标签高亮（curBot 已从 localStorage 读取）
+document.querySelectorAll(".bot-tab").forEach(el=>{
+  el.classList.toggle("active",el.dataset.bot===curBot);
+});
+fetchStatus();loadKeys();
+// 先拉一次快照，立即显示历史日志（防止 SSE 被云端缓冲时面板空白）
+fetch("/api/logs/snapshot?bot="+curBot+"&since=0")
+  .then(r=>r.json())
+  .then(d=>{
+    if(d.lines)d.lines.forEach(t=>_appendLog(t,true));
+    if(d.seq){_sseSeq=d.seq;_pollSeq=d.seq;}
+  })
+  .catch(()=>{})
+  .finally(()=>startSSE());
 setInterval(fetchStatus,3000);
 </script>
 </body>
