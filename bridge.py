@@ -183,9 +183,13 @@ def think_env_prefix(model, level):
     return ""
 
 
-# 厂商原生支持 Anthropic 格式的端点：直连，跳过 anthropic_proxy + LiteLLM
+# DeepSeek 有原生 Anthropic 兼容端点，直连（真实 key + 真实 model 名）
+# GLM/MiniMax/百炼 通过本地 anthropic_proxy（端口 4001）转发，proxy 直接路由到各厂商
 NATIVE_ANTHROPIC_BASE = {
     "deepseek": "https://api.deepseek.com/anthropic",
+    "zhipu":    "http://localhost:4001",
+    "minimax":  "http://localhost:4001",
+    "bailian":  "http://localhost:4001",
 }
 
 
@@ -198,14 +202,20 @@ def claude_launch_cmd(model=None, extra_args="", thinking=None):
     think_pre = think_env_prefix(m, thinking)
     if provider == "claude":
         return f"{think_pre}claude --dangerously-skip-permissions --model {m}{extra_args}"
-    # 原生 Anthropic 端点：直连厂商，model 用真名，key 用真 key
     if provider in NATIVE_ANTHROPIC_BASE:
-        key = get_api_keys().get(provider, "")
-        if key:
-            _approve_custom_key(key)
-            base = NATIVE_ANTHROPIC_BASE[provider]
-            return f"{think_pre}ANTHROPIC_API_KEY={key} ANTHROPIC_BASE_URL={base} claude --dangerously-skip-permissions --model {m}{extra_args}"
-    # 兜底：走本地 anthropic_proxy → LiteLLM
+        base = NATIVE_ANTHROPIC_BASE[provider]
+        if "localhost" in base:
+            # 本地代理（GLM/MiniMax/百炼）：placeholder key + CLI 别名，proxy 负责转发到真实厂商
+            _approve_custom_key("sk-placeholder")
+            cli_model = get_cli_model(m)
+            return f"{think_pre}ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL={base} claude --dangerously-skip-permissions --model {cli_model}{extra_args}"
+        else:
+            # 原生 Anthropic 端点（DeepSeek）：真实 key + 真实 model 名，直连厂商
+            key = get_api_keys().get(provider, "")
+            if key:
+                _approve_custom_key(key)
+                return f"{think_pre}ANTHROPIC_API_KEY={key} ANTHROPIC_BASE_URL={base} claude --dangerously-skip-permissions --model {m}{extra_args}"
+    # 兜底（不应走到这里）
     _approve_custom_key("sk-placeholder")
     cli_model = get_cli_model(m)
     return f"ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL={ANTHROPIC_PROXY_URL} claude --dangerously-skip-permissions --model {cli_model}{extra_args}"
@@ -865,16 +875,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if tmux_exists(tmux_sess):
             tmux_send_with_enter(text, session=tmux_sess)
-        elif provider != "claude":
-            threading.Thread(
-                target=self._call_api_and_reply,
-                args=(chat_id, text, model, provider, bot_path),
-                daemon=True,
-            ).start()
         else:
-            self.reply(chat_id, f"tmux session '{tmux_sess}' not found, 请先启动")
-            if os.path.exists(pending_file):
-                os.remove(pending_file)
+            # 所有模型统一走 Claude Code tmux 模式，session 不存在则自动创建并启动
+            work_dir = self.profile.get("work_dir")
+            new_args = ["tmux", "new-session", "-d", "-s", tmux_sess]
+            if work_dir:
+                new_args += ["-c", work_dir]
+            subprocess.run(new_args, capture_output=True)
+            time.sleep(0.3)
+            thinking_val = get_thinking(self.profile.get("thinking_file"))
+            tmux_send_with_enter(claude_launch_cmd(model, thinking=thinking_val), session=tmux_sess)
+            self.reply(chat_id, f"🚀 {model} 正在启动（Claude Code 模式），消息将在 5 秒后自动发送...")
+            def _delayed_send(txt=text, sess=tmux_sess):
+                time.sleep(5)
+                tmux_send_with_enter(txt, session=sess)
+            threading.Thread(target=_delayed_send, daemon=True).start()
 
     def _call_api_and_reply(self, chat_id, text, model, provider, bot_path="/"):
         hist_key = f"{bot_path}:{chat_id}"

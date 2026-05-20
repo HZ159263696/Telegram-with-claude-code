@@ -2,23 +2,73 @@
 """
 Anthropic-to-OpenAI Translation Proxy
 
-Sits between Claude Code CLI and LiteLLM:
+Sits between Claude Code CLI and upstream providers:
   Claude Code CLI (Anthropic Messages API)
     → anthropic_proxy.py (port 4001, translates format)
-      → LiteLLM (port 4000, OpenAI Chat Completions API)
-        → Upstream providers (DeepSeek, 智谱, MiniMax, 百炼)
+      → 智谱 / MiniMax / 百炼 (OpenAI-compatible endpoints, direct)
 
-Claude Code CLI sends Anthropic Messages API format to ANTHROPIC_BASE_URL.
-This proxy converts it to OpenAI format, forwards to LiteLLM, and converts back.
+Routes by model alias (CLI_MODEL_ALIAS from bridge.py).
+API keys are read from ~/.claude/telegram_api_keys.json.
 """
 
+import base64
+import hashlib
+import hmac
 import json
+import os
 import sys
+import time as _time
 import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-LITELLM_URL = "http://localhost:4000/v1/chat/completions"
 PROXY_PORT = 4001
+API_KEYS_FILE = os.path.expanduser("~/.claude/telegram_api_keys.json")
+
+# CLI model alias → (api_base_url, real_model_name, provider_key)
+_MODEL_ROUTES = {
+    "claude-3-sonnet-20240229":  ("https://open.bigmodel.cn/api/paas/v4",              "glm-4-plus",    "zhipu"),
+    "claude-3-haiku-20240307":   ("https://open.bigmodel.cn/api/paas/v4",              "glm-4-flash",   "zhipu"),
+    "claude-3-5-haiku-20241022": ("https://api.minimax.chat/v1",                        "abab6.5s-chat", "minimax"),
+    "claude-3-5-sonnet-latest":  ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-max",      "bailian"),
+    "claude-3-opus-latest":      ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus",     "bailian"),
+}
+
+
+def _load_api_keys():
+    if os.path.exists(API_KEYS_FILE):
+        try:
+            return json.load(open(API_KEYS_FILE))
+        except Exception:
+            pass
+    return {}
+
+
+def _zhipu_jwt(api_key):
+    id_, secret = api_key.split(".", 1)
+    def b64(s):
+        return base64.urlsafe_b64encode(s if isinstance(s, bytes) else s.encode()).rstrip(b"=").decode()
+    header  = b64(json.dumps({"alg": "HS256", "sign_type": "SIGN"}, separators=(",", ":")))
+    ts      = int(_time.time() * 1000)
+    payload = b64(json.dumps({"api_key": id_, "exp": ts + 3600000, "timestamp": ts}, separators=(",", ":")))
+    sig     = hmac.new(secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest()
+    return f"{header}.{payload}.{b64(sig)}"
+
+
+def _resolve_route(model):
+    """Return (endpoint_url, real_model, auth_header) for a CLI model alias, or None if unknown."""
+    route = _MODEL_ROUTES.get(model)
+    if not route:
+        return None
+    base_url, real_model, provider = route
+    keys = _load_api_keys()
+    if provider == "zhipu":
+        api_key = keys.get("zhipu", "")
+        token = _zhipu_jwt(api_key) if api_key and "." in api_key else api_key
+        auth = f"Bearer {token}"
+    else:
+        api_key = keys.get(provider, "")
+        auth = f"Bearer {api_key}"
+    return f"{base_url}/chat/completions", real_model, auth
 
 
 def anthropic_to_openai(body):
@@ -190,13 +240,16 @@ def openai_to_anthropic(result, model):
     }
 
 
-def openai_stream_to_anthropic_stream(openai_body, model):
-    """Send streaming request to LiteLLM and yield Anthropic SSE events."""
+def openai_stream_to_anthropic_stream(openai_body, model, endpoint_url=None, auth_header=None):
+    """Send streaming request to upstream provider and yield Anthropic SSE events."""
     data = json.dumps(openai_body).encode()
+    headers = {"Content-Type": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
     req = urllib.request.Request(
-        LITELLM_URL,
+        endpoint_url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
 
     # Yield message_start
@@ -322,15 +375,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
         model = body.get("model", "unknown")
         is_stream = body.get("stream", False)
 
-        print(f"[proxy] {model} stream={is_stream} messages={len(body.get('messages', []))}")
+        # Resolve route: CLI alias → real endpoint + real model
+        route = _resolve_route(model)
+        if route:
+            endpoint_url, real_model, auth_header = route
+        else:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "type": "error",
+                "error": {"type": "api_error", "message": f"Unknown model alias: {model}"},
+            }).encode())
+            return
+
+        print(f"[proxy] {model} → {real_model} stream={is_stream} messages={len(body.get('messages', []))}")
 
         try:
             openai_body = anthropic_to_openai(body)
+            openai_body["model"] = real_model
 
             if is_stream:
-                self._handle_stream(openai_body, model)
+                self._handle_stream(openai_body, model, endpoint_url, auth_header)
             else:
-                self._handle_sync(openai_body, model)
+                self._handle_sync(openai_body, model, endpoint_url, auth_header)
         except urllib.error.HTTPError as e:
             # Forward the actual HTTP status code (e.g., 429 rate limit) instead of always 500
             err_body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
@@ -357,15 +425,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(error_resp).encode())
 
-    def _handle_sync(self, openai_body, model):
+    def _handle_sync(self, openai_body, model, endpoint_url, auth_header):
         """Non-streaming request."""
         openai_body["stream"] = False
         data = json.dumps(openai_body).encode()
-        req = urllib.request.Request(
-            LITELLM_URL,
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
+        headers = {"Content-Type": "application/json"}
+        if auth_header:
+            headers["Authorization"] = auth_header
+        req = urllib.request.Request(endpoint_url, data=data, headers=headers)
         with urllib.request.urlopen(req, timeout=120) as r:
             result = json.loads(r.read())
 
@@ -377,7 +444,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(out)
 
-    def _handle_stream(self, openai_body, model):
+    def _handle_stream(self, openai_body, model, endpoint_url, auth_header):
         """Streaming request - convert OpenAI SSE to Anthropic SSE."""
         openai_body["stream"] = True
         try:
@@ -386,7 +453,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
 
-            for event in openai_stream_to_anthropic_stream(openai_body, model):
+            for event in openai_stream_to_anthropic_stream(openai_body, model, endpoint_url, auth_header):
                 line = f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
                 self.wfile.write(line.encode())
                 self.wfile.flush()
