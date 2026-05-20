@@ -101,6 +101,20 @@ if [ -n "$TMUX" ]; then
         "claude --dangerously-skip-permissions --model $STOCK_MODEL"
     echo "    tmux session 'claude_stock' started in /mnt/d/cao_stock (model: $STOCK_MODEL)"
 
+    # 1.6 Start Feishu Claude Code session (飞书Bot 独立工作区)
+    echo "[1.6] Starting tmux session 'claude_feishu' (飞书Bot)..."
+    tmux kill-session -t claude_feishu 2>/dev/null || true
+    FEISHU_MODEL_FILE="$HOME/.claude/telegram_model_feishu"
+    FEISHU_MODEL="claude-sonnet-4-6"
+    if [ -f "$FEISHU_MODEL_FILE" ]; then
+        FEISHU_MODEL=$(cat "$FEISHU_MODEL_FILE" | tr -d '[:space:]')
+        [ -z "$FEISHU_MODEL" ] && FEISHU_MODEL="claude-sonnet-4-6"
+    fi
+    mkdir -p /mnt/d/AI/feishu_workspace
+    tmux new-session -d -s claude_feishu -c /mnt/d/AI/feishu_workspace \
+        "claude --dangerously-skip-permissions --model $FEISHU_MODEL"
+    echo "    tmux session 'claude_feishu' started in /mnt/d/AI/feishu_workspace (model: $FEISHU_MODEL)"
+
     # 2. Start ngrok tunnel with auto-reconnect / 启动 ngrok 隧道（自动重连）
     # 用 ngrok 而不是 cloudflared/localtunnel: Telegram DNS 对 trycloudflare/loca.lt 不稳定，会拒绝解析
     echo "[2] Starting tunnel via ngrok (with auto-reconnect)..."
@@ -112,7 +126,7 @@ if [ -n "$TMUX" ]; then
             > "$SLOG"
             # ngrok 免费版不支持代理，启动前 unset 所有 proxy 环境变量
             env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
-                ngrok http $PORT --log stdout --log-format=logfmt > "$SLOG" 2>&1 &
+                ngrok http $PORT --domain=mantis-erasure-shown.ngrok-free.dev --log stdout --log-format=logfmt > "$SLOG" 2>&1 &
             LT_PID=$!
 
             # Wait for URL / 等待 URL 出现（通过本地 API 4040 拿，避免 stdout 缓冲）

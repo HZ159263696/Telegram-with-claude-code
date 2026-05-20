@@ -1,77 +1,61 @@
 #!/usr/bin/env python3
-"""飞书 ↔ Claude Code 桥接（长连接模式）
+"""飞书 ↔ Claude Code 桥接（tmux 常驻模式）
 
-群里 @机器人 或私聊机器人 → 调用 Claude Code CLI → 回复消息
+消息通过 tmux send-keys 注入 claude_feishu session，Stop 钩子读 transcript 后回复飞书。
 """
 
 import json
 import os
-import signal
 import subprocess
 import threading
 import time
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
-    CreateMessageRequest,
-    CreateMessageRequestBody,
     GetMessageResourceRequest,
     P2ImMessageReceiveV1,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
 
-APP_ID = os.environ.get("FEISHU_APP_ID", "REDACTED_FEISHU_APP_ID")
+APP_ID     = os.environ.get("FEISHU_APP_ID",     "REDACTED_FEISHU_APP_ID")
 APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/home/<user>/.local/bin/claude")
-_t = os.environ.get("CLAUDE_TIMEOUT", "0").strip()  # 0 或空 = 无超时
-CLAUDE_TIMEOUT = int(_t) if _t and _t != "0" else None
-MAX_REPLY_LEN = 28000  # 飞书单条文本上限 ~30000
+MAX_REPLY_LEN = 28000
+
+TMUX_SESSION        = "claude_feishu"
+PENDING_FILE        = os.path.expanduser("~/.claude/telegram_pending_feishu")
+FEISHU_CHAT_ID_FILE = os.path.expanduser("~/.claude/feishu_chat_id")
+FEISHU_MSG_ID_FILE  = os.path.expanduser("~/.claude/feishu_reply_message_id")
 
 client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
-
-# 正在运行的 Claude 子进程：chat_id -> [Popen, ...]，供 /stop 中断
-_running_procs: dict[str, list[subprocess.Popen]] = {}
-_procs_lock = threading.Lock()
 _start_time = time.time()
 
 
-def _register_proc(chat_id: str, proc: subprocess.Popen) -> None:
-    with _procs_lock:
-        _running_procs.setdefault(chat_id, []).append(proc)
+# ── tmux 工具 ──────────────────────────────────────────────────────────────────
+
+def tmux_exists() -> bool:
+    r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and TMUX_SESSION in r.stdout.split()
 
 
-def _unregister_proc(chat_id: str, proc: subprocess.Popen) -> None:
-    with _procs_lock:
-        lst = _running_procs.get(chat_id) or []
-        if proc in lst:
-            lst.remove(proc)
-        if not lst and chat_id in _running_procs:
-            _running_procs.pop(chat_id, None)
+def tmux_send_with_enter(text: str) -> bool:
+    """通过 tmux buffer paste 发送文本 + Enter（多行安全）。"""
+    if not tmux_exists():
+        return False
+    subprocess.run(["tmux", "load-buffer", "-"], input=text.encode())
+    subprocess.run(["tmux", "paste-buffer", "-t", TMUX_SESSION])
+    time.sleep(0.3)
+    subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"])
+    return True
 
 
-def _kill_chat_procs(chat_id: str) -> int:
-    """终止某 chat 下所有正在运行的 Claude 子进程，返回数量。"""
-    with _procs_lock:
-        procs = list(_running_procs.get(chat_id) or [])
-    n = 0
-    for p in procs:
-        if p.poll() is None:
-            try:
-                # 杀整个进程组，避免 shell/子孙残留
-                if os.name != "nt":
-                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-                else:
-                    p.terminate()
-                n += 1
-            except Exception:
-                try:
-                    p.terminate()
-                    n += 1
-                except Exception:
-                    pass
-    return n
+def tmux_interrupt():
+    """向 tmux session 发送 Ctrl+C。"""
+    subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-c"])
 
+
+# ── 飞书消息工具 ───────────────────────────────────────────────────────────────
 
 def extract_content(message) -> tuple[str, str]:
     """从飞书消息体提取文本和图片 key，返回 (text, image_key)。"""
@@ -95,7 +79,7 @@ def extract_content(message) -> tuple[str, str]:
 
 
 def download_feishu_image(message_id: str, image_key: str) -> str:
-    """从飞书下载图片，保存到 /tmp，返回本地路径；失败返回空字符串。"""
+    """从飞书下载图片到 /tmp，返回本地路径；失败返回空字符串。"""
     try:
         req = GetMessageResourceRequest.builder() \
             .message_id(message_id) \
@@ -116,54 +100,8 @@ def download_feishu_image(message_id: str, image_key: str) -> str:
         return ""
 
 
-def call_claude(prompt: str, chat_id: str = "", image_path: str = "") -> str:
-    """调用 Claude Code CLI；image_path 非空时把路径写进 prompt 让 Claude 用 Read 工具读图。"""
-    proc = None
-    try:
-        if image_path:
-            prompt = f"请用 Read 工具查看图片 {image_path}\n\n用户问题：{prompt}"
-        cmd = [CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"]
-        popen_kwargs = dict(
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        # POSIX 下开新进程组，便于 killpg 整组终止
-        if os.name != "nt":
-            popen_kwargs["preexec_fn"] = os.setsid
-        proc = subprocess.Popen(cmd, **popen_kwargs)
-        if chat_id:
-            _register_proc(chat_id, proc)
-        try:
-            stdout, stderr = proc.communicate(timeout=CLAUDE_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            try:
-                if os.name != "nt":
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                else:
-                    proc.terminate()
-            except Exception:
-                pass
-            return f"[超时] Claude 在 {CLAUDE_TIMEOUT} 秒内未返回（设置 CLAUDE_TIMEOUT=0 可取消限制）"
-
-        # 被 /stop 杀掉
-        if proc.returncode and proc.returncode < 0:
-            return "[已中断] /stop"
-
-        out = (stdout or "").strip()
-        if not out:
-            err = (stderr or "").strip()
-            return f"[Claude 无输出]\n{err[:500]}" if err else "[Claude 无输出]"
-        return out
-    except Exception as e:
-        return f"[调用失败] {e}"
-    finally:
-        if proc is not None and chat_id:
-            _unregister_proc(chat_id, proc)
-
-
 def send_reply(message_id: str, text: str) -> None:
-    """以回复方式发送文本消息。"""
+    """以回复方式发送飞书文本消息。"""
     text = text[:MAX_REPLY_LEN]
     body = ReplyMessageRequestBody.builder() \
         .content(json.dumps({"text": text}, ensure_ascii=False)) \
@@ -178,14 +116,16 @@ def send_reply(message_id: str, text: str) -> None:
         lark.logger.error(f"回复失败 code={resp.code} msg={resp.msg}")
 
 
+# ── 指令处理 ───────────────────────────────────────────────────────────────────
+
 HELP_TEXT = (
     "可用指令：\n"
-    "/stop — 中断当前会话内正在运行的 Claude\n"
-    "/status — 查看运行状态\n"
-    "/clear — 清空当前会话的运行记录（不影响 Claude 历史，本机器人为一次性模式）\n"
-    "/ping — 健康检查\n"
-    "/help — 显示本帮助\n"
-    "其他文本将作为 prompt 发给 Claude Code。"
+    "/stop   — 中断 Claude 当前任务（Ctrl+C）\n"
+    "/clear  — 清空 Claude 上下文（/clear）\n"
+    "/status — 查看 tmux session 状态\n"
+    "/ping   — 健康检查\n"
+    "/help   — 显示本帮助\n"
+    "其他文本或图片将注入 Claude Code（持续上下文模式）。"
 )
 
 
@@ -202,34 +142,46 @@ def handle_command(chat_id: str, message_id: str, text: str) -> bool:
         return True
 
     if cmd == "/status":
-        with _procs_lock:
-            running = sum(1 for ps in _running_procs.values() for p in ps if p.poll() is None)
-            mine = sum(1 for p in (_running_procs.get(chat_id) or []) if p.poll() is None)
+        session_ok = tmux_exists()
+        pending = os.path.exists(PENDING_FILE)
         uptime = int(time.time() - _start_time)
         send_reply(
             message_id,
-            f"运行中: {running} 个 Claude 子进程（本会话 {mine}）\n"
-            f"Uptime: {uptime}s\n"
-            f"CLAUDE_TIMEOUT: {CLAUDE_TIMEOUT if CLAUDE_TIMEOUT else '无'}",
+            f"tmux claude_feishu: {'✅ 运行中' if session_ok else '❌ 未运行'}\n"
+            f"等待回复: {'是' if pending else '否'}\n"
+            f"Uptime: {uptime}s",
         )
         return True
 
     if cmd == "/stop":
-        n = _kill_chat_procs(chat_id)
-        send_reply(message_id, f"已中断 {n} 个运行中的 Claude" if n else "当前会话没有运行中的 Claude")
+        if tmux_exists():
+            tmux_interrupt()
+            try:
+                os.remove(PENDING_FILE)
+            except FileNotFoundError:
+                pass
+            send_reply(message_id, "已中断 Claude")
+        else:
+            send_reply(message_id, "Claude session 未运行")
         return True
 
     if cmd == "/clear":
-        # 一次性模式无持久会话；仅杀掉当前 chat 的运行进程，给个确认
-        _kill_chat_procs(chat_id)
-        send_reply(message_id, "已清理当前会话的运行进程（本机器人每次调用都是独立子进程，无持久上下文）")
+        if tmux_exists():
+            tmux_interrupt()
+            time.sleep(0.3)
+            tmux_send_with_enter("/clear")
+            send_reply(message_id, "已清空 Claude 上下文")
+        else:
+            send_reply(message_id, "Claude session 未运行")
         return True
 
     return False
 
 
+# ── 消息处理 ───────────────────────────────────────────────────────────────────
+
 def handle_message(data: P2ImMessageReceiveV1) -> None:
-    """异步处理：取文本/图片 → 调 Claude → 回复。"""
+    """提取文本/图片 → 写 pending 文件 → 注入 tmux；Stop 钩子负责回复。"""
     msg = data.event.message
     chat_id = getattr(msg, "chat_id", "") or ""
     text, image_key = extract_content(msg)
@@ -238,24 +190,34 @@ def handle_message(data: P2ImMessageReceiveV1) -> None:
         send_reply(msg.message_id, "（暂只支持文本和图片消息哦）")
         return
 
-    image_path = ""
+    # 图片：下载到本地，把路径拼入 prompt
     if image_key:
         image_path = download_feishu_image(msg.message_id, image_key)
         if not image_path:
             send_reply(msg.message_id, "图片下载失败，请重试")
             return
-        if not text:
-            text = "请描述这张图片的内容"
+        text = f"请用 Read 工具查看图片 {image_path}\n\n用户问题：{text or '请描述这张图片的内容'}"
 
-    lark.logger.info(f"收到消息: {text[:80]}" + (f" [图片:{image_path}]" if image_path else ""))
+    lark.logger.info(f"收到消息: {text[:80]}")
 
     if text.startswith("/"):
         if handle_command(chat_id, msg.message_id, text):
             return
 
-    send_reply(msg.message_id, "⏳ 正在处理...")
-    reply = call_claude(text, chat_id=chat_id, image_path=image_path)
-    send_reply(msg.message_id, reply)
+    if not tmux_exists():
+        send_reply(msg.message_id, "❌ Claude 未启动（tmux session claude_feishu 不存在）")
+        return
+
+    # 写 pending 文件（Stop 钩子据此决定回复哪个 bot）
+    with open(PENDING_FILE, "w") as f:
+        f.write(str(int(time.time())))
+    with open(FEISHU_CHAT_ID_FILE, "w") as f:
+        f.write(chat_id)
+    with open(FEISHU_MSG_ID_FILE, "w") as f:
+        f.write(msg.message_id)
+
+    send_reply(msg.message_id, "⏳ 正在思考...")
+    tmux_send_with_enter(text)
 
 
 def on_message(data: P2ImMessageReceiveV1) -> None:
@@ -274,7 +236,7 @@ def main() -> None:
         event_handler=handler,
         log_level=lark.LogLevel.DEBUG,
     )
-    print(f"[feishu_bridge] 启动中… App={APP_ID}", flush=True)
+    print(f"[feishu_bridge] 启动中… App={APP_ID} tmux={TMUX_SESSION}", flush=True)
     ws.start()
 
 
