@@ -216,7 +216,6 @@ def handle_message(data: P2ImMessageReceiveV1) -> None:
     with open(FEISHU_MSG_ID_FILE, "w") as f:
         f.write(msg.message_id)
 
-    send_reply(msg.message_id, "⏳ 正在思考...")
     tmux_send_with_enter(text)
 
 

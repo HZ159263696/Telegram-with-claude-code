@@ -33,6 +33,7 @@ BOTS = {
         "name":         "主控Bot",
         "tmux_session": "claude",
         "model_file":   os.path.expanduser("~/.claude/telegram_model"),
+        "thinking_file":os.path.expanduser("~/.claude/telegram_thinking"),
         "pending_file": os.path.expanduser("~/.claude/telegram_pending"),
         "chat_id_file":os.path.expanduser("~/.claude/telegram_chat_id"),
         "work_dir":     None,
@@ -43,6 +44,7 @@ BOTS = {
         "name":         "股票Bot",
         "tmux_session": "claude_stock",
         "model_file":   os.path.expanduser("~/.claude/telegram_model_stock"),
+        "thinking_file":os.path.expanduser("~/.claude/telegram_thinking_stock"),
         "pending_file": os.path.expanduser("~/.claude/telegram_pending_stock"),
         "chat_id_file":os.path.expanduser("~/.claude/telegram_chat_id_stock"),
         "work_dir":     "/mnt/d/cao_stock",
@@ -53,6 +55,7 @@ BOTS = {
         "name":         "飞书Bot",
         "tmux_session": "claude_feishu",
         "model_file":   os.path.expanduser("~/.claude/telegram_model_feishu"),
+        "thinking_file":os.path.expanduser("~/.claude/telegram_thinking_feishu"),
         "pending_file": os.path.expanduser("~/.claude/telegram_pending_feishu"),
         "chat_id_file":os.path.expanduser("~/.claude/feishu_chat_id"),
         "work_dir":     "/mnt/d/AI/feishu_workspace",
@@ -84,6 +87,31 @@ _NATIVE_ANTHROPIC_BASE = {
     "deepseek-v4-flash": "https://api.deepseek.com/anthropic",
     "deepseek-v4-pro":   "https://api.deepseek.com/anthropic",
 }
+
+# ── 思考档位（reasoning effort）─────────────────────────────────────────────────
+# 档位 → MAX_THINKING_TOKENS 预算（仅对走 Claude Code CLI / Anthropic 端点的模型生效）
+_THINK_BUDGET = {
+    "medium": 8000,
+    "high":   16000,
+    "xhigh":  24000,
+    "max":    31999,
+}
+# 每个模型支持哪些思考档位（前端只渲染这里列出的档位；空 = 不显示思考切换）
+_MODEL_THINK = {
+    "claude-opus-4-7":           ["medium", "high", "xhigh", "max"],
+    "claude-sonnet-4-6":         ["medium", "high", "xhigh", "max"],
+    "claude-haiku-4-5-20251001": [],
+    "deepseek-v4-pro":           ["medium", "high", "xhigh", "max"],
+    "deepseek-v4-flash":         ["medium", "high"],
+}
+
+
+def _think_env_prefix(model, level):
+    """返回该模型+档位对应的 MAX_THINKING_TOKENS 环境变量前缀；不支持则空串。"""
+    level = (level or "").strip()
+    if level and level in _MODEL_THINK.get(model, []) and level in _THINK_BUDGET:
+        return f"MAX_THINKING_TOKENS={_THINK_BUDGET[level]} "
+    return ""
 
 
 def _get_provider_key(model):
@@ -143,12 +171,15 @@ def _tmux_session_exists(session):
     return session in r.stdout.split()
 
 
-def _relaunch_claude(model, bot_key="main"):
-    """Relaunch Claude Code in the bot's tmux session with the correct model/provider."""
+def _relaunch_claude(model, bot_key="main", thinking=None):
+    """Relaunch Claude Code in the bot's tmux session with the correct model/provider.
+
+    thinking: 思考档位 id（medium/high/xhigh/max）或 None；对支持的模型注入 MAX_THINKING_TOKENS。"""
     profile = _bot_or_default(bot_key)
     sess     = profile["tmux_session"]
     work_dir = profile.get("work_dir")
     name     = profile["name"]
+    think_pre = _think_env_prefix(model, thinking)
 
     def _do():
         if _tmux_session_exists(sess):
@@ -168,19 +199,20 @@ def _relaunch_claude(model, bot_key="main"):
 
         # Start with correct model
         if model in _CLAUDE_MODELS:
-            cmd = f"claude --dangerously-skip-permissions --model {model}"
+            cmd = f"{think_pre}claude --dangerously-skip-permissions --model {model}"
         elif model in _NATIVE_ANTHROPIC_BASE and _get_provider_key(model):
             # 直连厂商原生 Anthropic 端点（如 DeepSeek V4）
             base = _NATIVE_ANTHROPIC_BASE[model]
             key = _get_provider_key(model)
             _approve_custom_key(key)
-            cmd = f"ANTHROPIC_API_KEY={key} ANTHROPIC_BASE_URL={base} claude --dangerously-skip-permissions --model {model}"
+            cmd = f"{think_pre}ANTHROPIC_API_KEY={key} ANTHROPIC_BASE_URL={base} claude --dangerously-skip-permissions --model {model}"
         else:
             _approve_custom_key("sk-placeholder")
             cli_model = _CLI_MODEL_ALIAS.get(model, model)
             cmd = f"ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL={ANTHROPIC_PROXY_URL} claude --dangerously-skip-permissions --model {cli_model}"
         subprocess.run(["tmux", "send-keys", "-t", sess, cmd, "Enter"])
-        _log(f"[{name}] Claude Code relaunched with model: {model}", bot_key=bot_key)
+        _log(f"[{name}] Claude Code relaunched with model: {model}"
+             + (f" (thinking={thinking})" if think_pre else ""), bot_key=bot_key)
     threading.Thread(target=_do, daemon=True).start()
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -474,6 +506,15 @@ def get_status(bot_key="main"):
     # Per-bot tmux 状态
     tmux_running = _tmux_session_exists(profile["tmux_session"])
 
+    # Per-bot 思考档位
+    thinking = ""
+    tf = profile.get("thinking_file")
+    if tf and os.path.exists(tf):
+        try:
+            thinking = open(tf).read().strip()
+        except Exception:
+            pass
+
     return {
         "bot":     bot_key,
         "name":    profile["name"],
@@ -481,6 +522,7 @@ def get_status(bot_key="main"):
         "pid":     pid,
         "uptime":  uptime,
         "model":   model,
+        "thinking": thinking,
         "tokens":  tokens,
         "webhook": webhook,
         "chat_id": chat_id,
@@ -870,7 +912,28 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
 .badge-smart{background:rgba(0,212,255,.12);color:var(--accent);border:1px solid rgba(0,212,255,.2)}
 .badge-reason{background:rgba(255,180,0,.12);color:#ffb400;border:1px solid rgba(255,180,0,.2)}
 .badge-cheap{background:rgba(150,100,255,.12);color:#b080ff;border:1px solid rgba(150,100,255,.2)}
+.badge-think{background:rgba(255,180,0,.10);color:#ffb400;border:1px solid rgba(255,180,0,.18)}
 .divider{height:1px;background:var(--border);margin:0 20px}
+
+/* ── 思考档位选择 ── */
+.think-row{
+  display:flex;align-items:center;flex-wrap:wrap;gap:7px;
+  padding:2px 20px 12px 56px;
+}
+.think-label{font-size:10px;color:var(--text2);letter-spacing:.5px;margin-right:2px}
+.think-chip{
+  font-size:11px;font-weight:600;font-family:var(--font-mono);
+  padding:4px 11px;border-radius:14px;cursor:pointer;
+  background:rgba(255,180,0,.07);color:#caa24a;
+  border:1px solid rgba(255,180,0,.18);
+  transition:all .15s;letter-spacing:.3px;
+}
+.think-chip:hover{background:rgba(255,180,0,.16);color:#ffb400}
+.think-chip.on{
+  background:rgba(255,180,0,.22);color:#ffce5a;
+  border-color:rgba(255,180,0,.55);
+  box-shadow:0 0 8px rgba(255,180,0,.25);
+}
 
 /* ── Toast ── */
 .toast{
@@ -1007,20 +1070,28 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
 
 <script>
 const MODELS=[
-  {id:"claude-opus-4-7",  name:"Claude Opus 4.7",    prov:"Anthropic", icon:"🟣", desc:"最强推理，复杂任务首选",  badge:"smart",  badgeTxt:"SMART"},
-  {id:"claude-sonnet-4-6",name:"Claude Sonnet 4.6",  prov:"Anthropic", icon:"🔵", desc:"均衡性能，日常主力",      badge:"fast",   badgeTxt:"FAST"},
-  {id:"claude-haiku-4-5-20251001",name:"Claude Haiku 4.5",prov:"Anthropic",icon:"⚪",desc:"超快响应，轻量任务",   badge:"cheap",  badgeTxt:"LITE"},
-  {id:"deepseek-v4-flash",name:"DeepSeek V4 Flash",   prov:"DeepSeek",  icon:"🐋", desc:"经济快速，1M 上下文",    badge:"fast",   badgeTxt:"FAST"},
-  {id:"deepseek-v4-pro",  name:"DeepSeek V4 Pro",     prov:"DeepSeek",  icon:"🧠", desc:"旗舰思考模式，1M 上下文",badge:"reason", badgeTxt:"THINK"},
-  {id:"glm-4-plus",       name:"GLM-4 Plus",          prov:"ZhipuAI",   icon:"🌸", desc:"智谱旗舰，中文优化",     badge:"smart",  badgeTxt:"SMART"},
-  {id:"glm-4-flash",      name:"GLM-4 Flash",         prov:"ZhipuAI",   icon:"⚡", desc:"闪电响应，低成本",       badge:"cheap",  badgeTxt:"FAST"},
-  {id:"abab6.5s-chat",    name:"MiniMax 6.5s",        prov:"MiniMax",   icon:"🎭", desc:"多模态，长上下文",        badge:"smart",  badgeTxt:"MULTI"},
-  {id:"qwen-max",         name:"通义千问 Max",         prov:"Bailian",   icon:"☁️", desc:"阿里旗舰模型",           badge:"smart",  badgeTxt:"SMART"},
-  {id:"qwen-plus",        name:"通义千问 Plus",        prov:"Bailian",   icon:"🌤", desc:"性价比之选",             badge:"cheap",  badgeTxt:"FAST"},
+  {id:"claude-opus-4-7",  name:"Claude Opus 4.7",    prov:"Anthropic", icon:"🟣", desc:"最强推理，复杂任务首选",  badge:"smart",  badgeTxt:"SMART", think:["medium","high","xhigh","max"]},
+  {id:"claude-sonnet-4-6",name:"Claude Sonnet 4.6",  prov:"Anthropic", icon:"🔵", desc:"均衡性能，日常主力",      badge:"fast",   badgeTxt:"FAST",  think:["medium","high","xhigh","max"]},
+  {id:"claude-haiku-4-5-20251001",name:"Claude Haiku 4.5",prov:"Anthropic",icon:"⚪",desc:"超快响应，轻量任务",   badge:"cheap",  badgeTxt:"LITE",  think:[]},
+  {id:"deepseek-v4-flash",name:"DeepSeek V4 Flash",   prov:"DeepSeek",  icon:"🐋", desc:"经济快速，1M 上下文",    badge:"fast",   badgeTxt:"FAST",  think:["medium","high"]},
+  {id:"deepseek-v4-pro",  name:"DeepSeek V4 Pro",     prov:"DeepSeek",  icon:"🧠", desc:"旗舰思考模式，1M 上下文",badge:"reason", badgeTxt:"THINK", think:["medium","high","xhigh","max"]},
+  {id:"glm-4-plus",       name:"GLM-4 Plus",          prov:"ZhipuAI",   icon:"🌸", desc:"智谱旗舰，中文优化",     badge:"smart",  badgeTxt:"SMART", think:[]},
+  {id:"glm-4-flash",      name:"GLM-4 Flash",         prov:"ZhipuAI",   icon:"⚡", desc:"闪电响应，低成本",       badge:"cheap",  badgeTxt:"FAST",  think:[]},
+  {id:"abab6.5s-chat",    name:"MiniMax 6.5s",        prov:"MiniMax",   icon:"🎭", desc:"多模态，长上下文",        badge:"smart",  badgeTxt:"MULTI", think:[]},
+  {id:"qwen-max",         name:"通义千问 Max",         prov:"Bailian",   icon:"☁️", desc:"阿里旗舰模型",           badge:"smart",  badgeTxt:"SMART", think:[]},
+  {id:"qwen-plus",        name:"通义千问 Plus",        prov:"Bailian",   icon:"🌤", desc:"性价比之选",             badge:"cheap",  badgeTxt:"FAST",  think:[]},
 ];
+// 思考档位定义（id 与后端 _THINK_BUDGET / MODEL_THINK 一致）
+const THINK_LEVELS=[
+  {id:"medium", label:"Medium",     short:"中"},
+  {id:"high",   label:"High",       short:"高"},
+  {id:"xhigh",  label:"Extra high", short:"极高"},
+  {id:"max",    label:"Max",        short:"MAX"},
+];
+const THINK_LABEL=Object.fromEntries(THINK_LEVELS.map(t=>[t.id,t.label]));
 
 const BOT_NAMES={main:"主控Bot",stock:"股票Bot",feishu:"飞书Bot"};
-let paused=false,isRunning=false,curModel="claude-sonnet-4-6",curBot=(BOT_NAMES[localStorage.getItem("dash_curBot")]?localStorage.getItem("dash_curBot"):"main");
+let paused=false,isRunning=false,curModel="claude-sonnet-4-6",curThink="",curBot=(BOT_NAMES[localStorage.getItem("dash_curBot")]?localStorage.getItem("dash_curBot"):"main");
 
 function switchBot(bot){
   if(bot===curBot)return;
@@ -1051,9 +1122,11 @@ function buildSheet(){
     lbl.className="prov-label";lbl.textContent=prov;
     grp.appendChild(lbl);
     MODELS.filter(m=>m.prov===prov).forEach(m=>{
+      const sel=m.id===curModel;
       const row=document.createElement("div");
-      row.className="model-item"+(m.id===curModel?" selected":"");
+      row.className="model-item"+(sel?" selected":"");
       row.dataset.id=m.id;
+      const thinkBadge=(m.think&&m.think.length)?'<div class="model-badge badge-think">思考</div>':"";
       row.innerHTML=`
         <div class="model-radio"><div class="model-radio-dot"></div></div>
         <div class="model-icon">${m.icon}</div>
@@ -1061,9 +1134,25 @@ function buildSheet(){
           <div class="model-name">${m.name}</div>
           <div class="model-desc">${m.desc}</div>
         </div>
+        ${thinkBadge}
         <div class="model-badge badge-${m.badge}">${m.badgeTxt}</div>`;
       row.onclick=()=>selectModel(m);
       grp.appendChild(row);
+      // 思考档位行：仅当前选中且模型支持思考时展开
+      if(sel&&m.think&&m.think.length){
+        const tr=document.createElement("div");
+        tr.className="think-row";
+        let chips='<span class="think-label">思考程度</span>';
+        m.think.forEach(lv=>{
+          const on=(lv===curThink)?" on":"";
+          chips+=`<button class="think-chip${on}" data-lv="${lv}">${THINK_LABEL[lv]}</button>`;
+        });
+        tr.innerHTML=chips;
+        tr.querySelectorAll(".think-chip").forEach(btn=>{
+          btn.onclick=(e)=>{e.stopPropagation();selectThink(m,btn.dataset.lv);};
+        });
+        grp.appendChild(tr);
+      }
       const div=document.createElement("div");div.className="divider";grp.appendChild(div);
     });
     body.appendChild(grp);
@@ -1071,20 +1160,36 @@ function buildSheet(){
 }
 
 function selectModel(m){
+  const changed=(m.id!==curModel);
   curModel=m.id;
-  switchModel(m.id,m);
-  document.querySelectorAll(".model-item").forEach(el=>{
-    el.classList.toggle("selected",el.dataset.id===m.id);
-  });
+  // 切换到新模型时，沿用旧档位（若新模型支持），否则清空让模型默认
+  if(changed&&!(m.think||[]).includes(curThink))curThink="";
+  switchModel(m.id,m,curThink);
   updateTrigger(m);
   document.getElementById("sheetSub").textContent=`共 ${MODELS.length} 个模型 · 已选：${m.name}`;
-  setTimeout(closeSheet,320);
+  // 若该模型支持思考档位，展开档位行让用户继续选；否则收起面板
+  if((m.think||[]).length){buildSheet();}
+  else{
+    document.querySelectorAll(".model-item").forEach(el=>{
+      el.classList.toggle("selected",el.dataset.id===m.id);
+    });
+    setTimeout(closeSheet,320);
+  }
+}
+
+function selectThink(m,lv){
+  curModel=m.id;
+  curThink=(lv===curThink)?"":lv;   // 再次点击同档位 = 取消
+  switchModel(m.id,m,curThink);
+  updateTrigger(m);
+  buildSheet();
 }
 
 function updateTrigger(m){
   document.getElementById("triggerIcon").textContent=m.icon;
   document.getElementById("triggerName").textContent=m.name;
-  document.getElementById("triggerProv").textContent=m.prov;
+  const tk=(curThink&&THINK_LABEL[curThink]&&(m.think||[]).includes(curThink))?(" · 思考 "+THINK_LABEL[curThink]):"";
+  document.getElementById("triggerProv").textContent=m.prov+tk;
 }
 
 function openSheet(){
@@ -1132,8 +1237,11 @@ function updateUI(s){
     row.className="status-row";
     document.getElementById("cUp").textContent="—";
   }
+  if(typeof s.thinking==="string")curThink=s.thinking;
   if(s.model&&s.model!==curModel){
     curModel=s.model;
+  }
+  {
     const m=MODELS.find(x=>x.id===curModel);
     if(m)updateTrigger(m);
   }
@@ -1160,12 +1268,13 @@ async function toggleBridge(){
     setTimeout(fetchStatus,600);
   }catch(e){toast("请求失败");}
 }
-async function switchModel(model,m){
+async function switchModel(model,m,thinking){
   try{
-    const r=await fetch("/api/model",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model,bot:curBot})});
+    const r=await fetch("/api/model",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model,bot:curBot,thinking:thinking||""})});
     const d=await r.json();
     const tag="["+(BOT_NAMES[curBot]||curBot)+"] ";
-    toast(d.ok?tag+"已切换：" +(m?m.name:model):"切换失败: "+d.error);
+    const tk=(d.thinking&&THINK_LABEL[d.thinking])?(" · 思考 "+THINK_LABEL[d.thinking]):"";
+    toast(d.ok?tag+"已切换：" +(m?m.name:model)+tk:"切换失败: "+d.error);
     fetchStatus();
   }catch(e){toast("请求失败");}
 }
@@ -1407,18 +1516,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(stop_bridge())
 
         elif path == "/api/model":
-            model   = data.get("model", "")
-            bot_key = data.get("bot") or self._query_bot()
+            model    = data.get("model", "")
+            bot_key  = data.get("bot") or self._query_bot()
+            thinking = (data.get("thinking") or "").strip()
             if bot_key not in BOTS:
                 bot_key = "main"
             if not model:
                 self._json({"ok": False, "error": "no model"})
                 return
+            # 档位非该模型支持时丢弃
+            if thinking and thinking not in _MODEL_THINK.get(model, []):
+                thinking = ""
             try:
                 with open(BOTS[bot_key]["model_file"], "w") as f:
                     f.write(model)
-                _relaunch_claude(model, bot_key=bot_key)
-                self._json({"ok": True, "model": model, "bot": bot_key})
+                tf = BOTS[bot_key].get("thinking_file")
+                if tf:
+                    with open(tf, "w") as f:
+                        f.write(thinking)
+                _relaunch_claude(model, bot_key=bot_key, thinking=thinking)
+                self._json({"ok": True, "model": model, "bot": bot_key, "thinking": thinking})
             except Exception as e:
                 self._json({"ok": False, "error": str(e)})
 

@@ -41,6 +41,7 @@ BOT_PROFILES = {
         "pending_file":  os.path.expanduser("~/.claude/telegram_pending"),
         "chat_id_file":  os.path.expanduser("~/.claude/telegram_chat_id"),
         "model_file":    os.path.expanduser("~/.claude/telegram_model"),
+        "thinking_file": os.path.expanduser("~/.claude/telegram_thinking"),
         "work_dir":      None,                  # 不指定工作目录
     },
     "/stock": {
@@ -51,6 +52,7 @@ BOT_PROFILES = {
         "pending_file":  os.path.expanduser("~/.claude/telegram_pending_stock"),
         "chat_id_file":  os.path.expanduser("~/.claude/telegram_chat_id_stock"),
         "model_file":    os.path.expanduser("~/.claude/telegram_model_stock"),
+        "thinking_file": os.path.expanduser("~/.claude/telegram_thinking_stock"),
         "work_dir":      "/mnt/d/cao_stock",    # 股票工作区
     },
 }
@@ -149,25 +151,60 @@ def model_flag():
     return f" --model {m}" if m else ""
 
 
+# ── 思考档位（reasoning effort）─────────────────────────────────────────────────
+THINKING_FILE = os.path.expanduser("~/.claude/telegram_thinking")
+# 档位 → MAX_THINKING_TOKENS 预算（仅对走 Claude Code CLI / Anthropic 端点的模型生效）
+THINK_BUDGET = {"medium": 8000, "high": 16000, "xhigh": 24000, "max": 31999}
+# 每个模型支持哪些思考档位（与 dashboard.py 的 _MODEL_THINK 保持一致）
+MODEL_THINK = {
+    "claude-opus-4-7":           ["medium", "high", "xhigh", "max"],
+    "claude-sonnet-4-6":         ["medium", "high", "xhigh", "max"],
+    "claude-haiku-4-5-20251001": [],
+    "deepseek-v4-pro":           ["medium", "high", "xhigh", "max"],
+    "deepseek-v4-flash":         ["medium", "high"],
+}
+
+
+def get_thinking(thinking_file=None):
+    f = thinking_file or THINKING_FILE
+    if os.path.exists(f):
+        try:
+            return open(f).read().strip()
+        except Exception:
+            pass
+    return ""
+
+
+def think_env_prefix(model, level):
+    """返回该模型+档位对应的 MAX_THINKING_TOKENS 环境变量前缀；不支持则空串。"""
+    level = (level or "").strip()
+    if level and level in MODEL_THINK.get(model, []) and level in THINK_BUDGET:
+        return f"MAX_THINKING_TOKENS={THINK_BUDGET[level]} "
+    return ""
+
+
 # 厂商原生支持 Anthropic 格式的端点：直连，跳过 anthropic_proxy + LiteLLM
 NATIVE_ANTHROPIC_BASE = {
     "deepseek": "https://api.deepseek.com/anthropic",
 }
 
 
-def claude_launch_cmd(model=None, extra_args=""):
-    """Build the full claude launch command, with ANTHROPIC_BASE_URL for non-Claude models."""
+def claude_launch_cmd(model=None, extra_args="", thinking=None):
+    """Build the full claude launch command, with ANTHROPIC_BASE_URL for non-Claude models.
+
+    thinking: 思考档位 id（medium/high/xhigh/max）；对支持的模型注入 MAX_THINKING_TOKENS。"""
     m = model or get_model() or "claude-opus-4-7"
     provider = get_provider(m)
+    think_pre = think_env_prefix(m, thinking)
     if provider == "claude":
-        return f"claude --dangerously-skip-permissions --model {m}{extra_args}"
+        return f"{think_pre}claude --dangerously-skip-permissions --model {m}{extra_args}"
     # 原生 Anthropic 端点：直连厂商，model 用真名，key 用真 key
     if provider in NATIVE_ANTHROPIC_BASE:
         key = get_api_keys().get(provider, "")
         if key:
             _approve_custom_key(key)
             base = NATIVE_ANTHROPIC_BASE[provider]
-            return f"ANTHROPIC_API_KEY={key} ANTHROPIC_BASE_URL={base} claude --dangerously-skip-permissions --model {m}{extra_args}"
+            return f"{think_pre}ANTHROPIC_API_KEY={key} ANTHROPIC_BASE_URL={base} claude --dangerously-skip-permissions --model {m}{extra_args}"
     # 兜底：走本地 anthropic_proxy → LiteLLM
     _approve_custom_key("sk-placeholder")
     cli_model = get_cli_model(m)
@@ -930,7 +967,8 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.5)
 
         # 用 paste-buffer 送启动命令；claude_launch_cmd 已预写 approved key，不会弹确认
-        tmux_send_with_enter(claude_launch_cmd(model), session=sess)
+        thinking = get_thinking(self.profile.get("thinking_file"))
+        tmux_send_with_enter(claude_launch_cmd(model, thinking=thinking), session=sess)
 
     # ── 自然语言股票快捷指令 ──────────────────────────────────────────────
 
@@ -1360,7 +1398,7 @@ class Handler(BaseHTTPRequestHandler):
         if not tmux_exists():
             subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION], capture_output=True)
             time.sleep(0.5)
-        tmux_send_with_enter(claude_launch_cmd(extra_args=f" --resume {session_id}"))
+        tmux_send_with_enter(claude_launch_cmd(extra_args=f" --resume {session_id}", thinking=get_thinking()))
 
     def _do_relaunch(self, chat_id):
         """Kill current Claude Code process in tmux and start a fresh one."""
