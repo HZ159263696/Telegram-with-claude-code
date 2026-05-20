@@ -37,6 +37,7 @@ BOTS = {
         "chat_id_file":os.path.expanduser("~/.claude/telegram_chat_id"),
         "work_dir":     None,
         "default_model":"claude-opus-4-7",
+        "bridge_managed": True,   # 走 bridge.py，接收全局 bridge 日志
     },
     "stock": {
         "name":         "股票Bot",
@@ -46,6 +47,17 @@ BOTS = {
         "chat_id_file":os.path.expanduser("~/.claude/telegram_chat_id_stock"),
         "work_dir":     "/mnt/d/cao_stock",
         "default_model":"claude-sonnet-4-6",
+        "bridge_managed": True,
+    },
+    "feishu": {
+        "name":         "飞书Bot",
+        "tmux_session": "claude_feishu",
+        "model_file":   os.path.expanduser("~/.claude/telegram_model_feishu"),
+        "pending_file": os.path.expanduser("~/.claude/telegram_pending_feishu"),
+        "chat_id_file":os.path.expanduser("~/.claude/feishu_chat_id"),
+        "work_dir":     "/mnt/d/AI/feishu_workspace",
+        "default_model":"claude-sonnet-4-6",
+        "bridge_managed": False,  # 独立进程 feishu_bridge.py，不接收 telegram bridge 全局日志
     },
 }
 
@@ -201,10 +213,14 @@ def _push_log(bot_key, text):
 
 
 def _log(line, bot_key=None):
-    """加时间戳的普通日志。bot_key=None 时广播到所有 Bot（用于 bridge 全局日志）。"""
+    """加时间戳的普通日志。bot_key=None 时广播到所有 bridge 托管的 Bot（telegram bridge 全局日志，
+    独立进程的 Bot 如飞书不接收，保持日志相互独立）。"""
     ts   = time.strftime("%H:%M:%S")
     text = f"[{ts}] {line.rstrip()}"
-    targets = [bot_key] if bot_key else list(BOTS.keys())
+    if bot_key:
+        targets = [bot_key]
+    else:
+        targets = [k for k, v in BOTS.items() if v.get("bridge_managed", True)]
     for k in targets:
         _push_log(k, text)
 
@@ -372,8 +388,9 @@ def start_bridge():
     global _bridge_proc, _bridge_start_time
     if _bridge_proc and _bridge_proc.poll() is None:
         return {"ok": False, "error": "Bridge already running"}
-    # Kill any stray bridge process (e.g. started by start.sh) before binding port
-    subprocess.call(["pkill", "-f", "bridge.py"], stderr=subprocess.DEVNULL)
+    # Kill any stray bridge process (e.g. started by start.sh) before binding port。
+    # 用 BRIDGE_SCRIPT 绝对路径精确匹配，避免误杀 feishu_bridge.py（独立进程，保持飞书Bot独立）。
+    subprocess.call(["pkill", "-f", BRIDGE_SCRIPT], stderr=subprocess.DEVNULL)
     bridge_port = int(os.environ.get("PORT", "9999"))
     subprocess.call(["fuser", "-k", f"{bridge_port}/tcp"], stderr=subprocess.DEVNULL)
     import time as _t; _t.sleep(0.5)  # wait for port to free
@@ -566,7 +583,7 @@ body::after{
   display:flex;gap:6px;
   background:var(--surface);border:1px solid var(--border);
   border-radius:12px;padding:4px;
-  max-width:480px;width:100%;margin-bottom:16px;
+  max-width:600px;width:100%;margin-bottom:16px;
 }
 .bot-tab{
   flex:1;background:transparent;border:none;cursor:pointer;
@@ -885,6 +902,9 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
   <button class="bot-tab" data-bot="stock" onclick="switchBot('stock')">
     <span class="bot-tab-dot"></span>股票Bot
   </button>
+  <button class="bot-tab" data-bot="feishu" onclick="switchBot('feishu')">
+    <span class="bot-tab-dot"></span>飞书Bot
+  </button>
 </div>
 
 <!-- Power Button -->
@@ -999,7 +1019,8 @@ const MODELS=[
   {id:"qwen-plus",        name:"通义千问 Plus",        prov:"Bailian",   icon:"🌤", desc:"性价比之选",             badge:"cheap",  badgeTxt:"FAST"},
 ];
 
-let paused=false,isRunning=false,curModel="claude-sonnet-4-6",curBot=(localStorage.getItem("dash_curBot")==="stock"?"stock":"main");
+const BOT_NAMES={main:"主控Bot",stock:"股票Bot",feishu:"飞书Bot"};
+let paused=false,isRunning=false,curModel="claude-sonnet-4-6",curBot=(BOT_NAMES[localStorage.getItem("dash_curBot")]?localStorage.getItem("dash_curBot"):"main");
 
 function switchBot(bot){
   if(bot===curBot)return;
@@ -1015,7 +1036,7 @@ function switchBot(bot){
   if(_pollTimer){clearTimeout(_pollTimer);_pollTimer=null;_usePolling=false;}
   fetchStatus();
   startSSE();
-  toast("已切换到 "+(bot==="stock"?"股票Bot":"主控Bot"));
+  toast("已切换到 "+(BOT_NAMES[bot]||bot));
 }
 
 // Build model sheet
@@ -1143,7 +1164,7 @@ async function switchModel(model,m){
   try{
     const r=await fetch("/api/model",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model,bot:curBot})});
     const d=await r.json();
-    const tag=curBot==="stock"?"[股票Bot] ":"[主控Bot] ";
+    const tag="["+(BOT_NAMES[curBot]||curBot)+"] ";
     toast(d.ok?tag+"已切换：" +(m?m.name:model):"切换失败: "+d.error);
     fetchStatus();
   }catch(e){toast("请求失败");}
