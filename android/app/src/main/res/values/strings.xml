@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Claude Bridge</string>
+    <string name="settings_title">连接设置</string>
+    <string name="settings_label_url">控制面板地址</string>
+    <string name="settings_hint_url">http://192.168.x.x:8888 或 https://xxx.ngrok-free.app</string>
+    <string name="settings_hint">填写电脑上跑着的 dashboard 公网或局域网地址：\n• 局域网：电脑 IP + :8888（同 WiFi 用，最快）\n• 公网：ngrok 隧道地址（外网用）\n\n电脑必须开着 bridge / dashboard 服务，否则连不上。</string>
+    <string name="btn_lan_preset">局域网示例</string>
+    <string name="btn_ngrok_preset">ngrok 示例</string>
+    <string name="btn_save">保存并打开</string>
+    <string name="toast_url_empty">地址不能为空</string>
+    <string name="toast_saved">已保存</string>
+    <string name="toast_set_url_first">请先设置控制面板地址</string>
+    <string name="action_reload">重新加载</string>
+    <string name="action_home">首页</string>
+    <string name="action_settings">设置</string>
+</resources>
