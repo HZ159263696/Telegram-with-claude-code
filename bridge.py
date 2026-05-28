@@ -9,7 +9,8 @@ import subprocess
 import threading
 import time
 import urllib.request
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import secrets
 
@@ -458,13 +459,15 @@ def get_session_id(project_path):
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _get_profile(self):
-        """Return bot profile matching the request path, fallback to '/'."""
-        path = self.path.split("?")[0].rstrip("/") or "/"
-        return BOT_PROFILES.get(path) or BOT_PROFILES.get("/")
-
     def do_POST(self):
-        self.profile = self._get_profile()
+        # Only the exact webhook paths (/, /stock, ...) are Telegram webhooks.
+        # Everything else — including /api/* coming from the dashboard frontend —
+        # gets reverse-proxied to dashboard.py on localhost:8888.
+        path = self.path.split("?")[0].rstrip("/") or "/"
+        if path not in BOT_PROFILES:
+            return self._proxy_to_dashboard("POST")
+
+        self.profile = BOT_PROFILES[path]
         self.bot_token = self.profile.get("token") or BOT_TOKEN
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         # Verify Telegram's secret_token header so forged POSTs to our public URL are dropped.
@@ -490,9 +493,93 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Claude-Telegram Bridge")
+        path = self.path.split("?")[0]
+        # /health is the watchdog probe — keep it served locally so the watchdog
+        # can verify the bridge is alive regardless of dashboard state.
+        if path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Claude-Telegram Bridge")
+            return
+        # Everything else is for the mobile app / browser → proxy to dashboard.
+        self._proxy_to_dashboard("GET")
+
+    DASHBOARD_HOST = "127.0.0.1"
+    DASHBOARD_PORT = 8888
+
+    def _proxy_to_dashboard(self, method):
+        """Reverse-proxy the current request to dashboard.py on localhost:8888.
+
+        Streams the response in 8 KiB chunks so SSE (`/api/logs`) keeps working
+        end-to-end and clients see events as they happen instead of after
+        connection close. Requires ThreadingHTTPServer so a long-lived SSE
+        connection doesn't block other requests.
+        """
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else None
+
+        # Forward headers but rewrite Host and drop hop-by-hop/length headers
+        fwd_headers = {}
+        for h in self.headers:
+            lh = h.lower()
+            if lh in ("host", "content-length", "connection", "keep-alive",
+                      "proxy-authenticate", "proxy-authorization", "te",
+                      "trailers", "transfer-encoding", "upgrade"):
+                continue
+            fwd_headers[h] = self.headers[h]
+        fwd_headers["Host"] = f"{self.DASHBOARD_HOST}:{self.DASHBOARD_PORT}"
+
+        # SSE needs a long timeout; everything else is fast
+        is_sse_request = "text/event-stream" in self.headers.get("Accept", "")
+        timeout = 300 if is_sse_request else 30
+
+        try:
+            conn = http.client.HTTPConnection(
+                self.DASHBOARD_HOST, self.DASHBOARD_PORT, timeout=timeout
+            )
+            conn.request(method, self.path, body=body, headers=fwd_headers)
+            resp = conn.getresponse()
+        except Exception as e:
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            try:
+                self.wfile.write(f"dashboard proxy error: {e}".encode())
+            except Exception:
+                pass
+            return
+
+        try:
+            self.send_response(resp.status)
+            for h, v in resp.getheaders():
+                # Skip hop-by-hop headers; let our server set Connection/Encoding.
+                if h.lower() in ("transfer-encoding", "connection",
+                                 "keep-alive", "proxy-authenticate",
+                                 "proxy-authorization", "te", "trailers",
+                                 "upgrade"):
+                    continue
+                self.send_header(h, v)
+            self.end_headers()
+
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Client disconnected (typical for SSE) — nothing to do.
+            pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def handle_callback(self, cb):
         chat_id = cb.get("message", {}).get("chat", {}).get("id")
@@ -1444,8 +1531,11 @@ def _get_tunnel_url():
 
 
 def _tunnel_alive(url):
+    # GET / now reverse-proxies to the dashboard UI, so probe the dedicated
+    # /health endpoint instead — it remains served by the bridge itself.
     try:
-        req = urllib.request.Request(url, headers={"ngrok-skip-browser-warning": "1"})
+        req = urllib.request.Request(f"{url.rstrip('/')}/health",
+                                     headers={"ngrok-skip-browser-warning": "1"})
         with urllib.request.urlopen(req, timeout=10) as r:
             return b"Claude-Telegram Bridge" in r.read(64)
     except Exception:
@@ -1584,8 +1674,9 @@ def main():
     print(f"Bridge on :{PORT} | tmux: {TMUX_SESSION}")
     print(f"Active bots: {[p['name'] for p in BOT_PROFILES.values() if p.get('token')]}")
     try:
-        HTTPServer.allow_reuse_address = True
-        HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+        # ThreadingHTTPServer so dashboard SSE streams don't block webhooks.
+        ThreadingHTTPServer.allow_reuse_address = True
+        ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
     except KeyboardInterrupt:
         print("\nStopped")
 

@@ -173,58 +173,11 @@ if [ -n "$TMUX" ]; then
     nohup env TELEGRAM_BOT_TOKEN="$TOKEN" STOCK_BOT_TOKEN="$STOCK_TOKEN" DASHBOARD_PORT=8888 python3 "$PROJECT/dashboard.py" > /tmp/dashboard.log 2>&1 &
     echo "    Dashboard started (log: /tmp/dashboard.log)"
 
-    # 3.5. Start cloudflared tunnel for dashboard (mobile access) with auto-reconnect
-    echo "[4.5] Starting tunnel for dashboard (with auto-reconnect)..."
-    pkill -f "cloudflared tunnel --url http://localhost:8888" 2>/dev/null; sleep 0.5
-    DASH_NOTIFIED=false
-    (
-        while true; do
-            DASH_SLOG=/tmp/lt_dashboard.log
-            > "$DASH_SLOG"
-            env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
-                cloudflared tunnel --url http://localhost:8888 --protocol http2 --retries 10 > "$DASH_SLOG" 2>&1 &
-            LT_PID=$!
-
-            # Wait for URL / 等待 URL 出现
-            DASH_URL=""
-            for i in $(seq 1 30); do
-                DASH_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$DASH_SLOG" 2>/dev/null | head -1)
-                [ -n "$DASH_URL" ] && break
-                sleep 1
-            done
-
-            if [ -n "$DASH_URL" ]; then
-                echo "    Dashboard public URL: $DASH_URL"
-                echo "$DASH_URL" > /tmp/dashboard_url.txt
-                # 仅在本次启动首次获取到 URL 时通知，重连不再重复发送
-                if [ ! -f /tmp/dashboard_notified_session.flag ]; then
-                    CHAT_ID=""
-                    [ -f "$HOME/.claude/telegram_chat_id" ] && CHAT_ID=$(cat "$HOME/.claude/telegram_chat_id" | tr -d '[:space:]')
-                    if [ -n "$CHAT_ID" ]; then
-                        curl -s "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-                            -d "chat_id=$CHAT_ID" \
-                            -d "parse_mode=HTML" \
-                            -d "text=📊 <b>Dashboard 已上线</b>%0A%0A<a href=\"$DASH_URL\">点击打开控制面板</a>%0A%0A实时查看 Claude Code 工作进度、日志、模型切换" \
-                            > /dev/null 2>&1
-                        echo "    Dashboard URL sent to Telegram"
-                        touch /tmp/dashboard_notified_session.flag
-                    fi
-                else
-                    echo "    Dashboard tunnel reconnected, skip duplicate notify"
-                fi
-            else
-                echo "    WARNING: Could not get dashboard tunnel URL, retrying in 5s..."
-                kill $LT_PID 2>/dev/null
-            fi
-
-            # Wait for lt to exit (crash), then auto-restart / 等 lt 断开后重连
-            wait $LT_PID 2>/dev/null
-            echo "    Dashboard tunnel crashed, reconnecting in 5s..."
-            sleep 5
-        done
-    ) &
-    DASH_TUNNEL_PID=$!
-    echo "    Dashboard tunnel manager started (pid: $DASH_TUNNEL_PID)"
+    # Dashboard 公网入口现在由 bridge.py 反向代理（同一个 ngrok 固定域名）
+    # 旧实现：用 cloudflared trycloudflare 给 dashboard 拉一条独立隧道，
+    # 但 trycloudflare 域名每次重启都变，手机 app 配置经常失效，已经废弃。
+    pkill -f "cloudflared tunnel --url http://localhost:8888" 2>/dev/null
+    rm -f /tmp/dashboard_url.txt /tmp/dashboard_notified_session.flag /tmp/lt_dashboard.log
 
     # 5. Start Feishu bridge (long-connection WebSocket)
     echo "[6] Starting Feishu bridge..."
