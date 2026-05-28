@@ -11,9 +11,7 @@ import time
 import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-import hmac
-import hashlib
-import base64
+import secrets
 
 # Bypass system proxy — proxy at 127.0.0.1:65533 breaks TLS to Telegram/external APIs
 urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
@@ -43,6 +41,7 @@ BOT_PROFILES = {
         "model_file":    os.path.expanduser("~/.claude/telegram_model"),
         "thinking_file": os.path.expanduser("~/.claude/telegram_thinking"),
         "work_dir":      None,                  # 不指定工作目录
+        "secret":        "",                    # webhook secret_token，main() 启动时随机生成
     },
     "/stock": {
         "name":          "股票Bot",
@@ -54,6 +53,7 @@ BOT_PROFILES = {
         "model_file":    os.path.expanduser("~/.claude/telegram_model_stock"),
         "thinking_file": os.path.expanduser("~/.claude/telegram_thinking_stock"),
         "work_dir":      "/mnt/d/cao_stock",    # 股票工作区
+        "secret":        "",                    # webhook secret_token，main() 启动时随机生成
     },
 }
 WECHAT_SEND_FILE = "/tmp/wechat_send.json"
@@ -72,21 +72,8 @@ TOKEN_STATS_FILE = os.path.expanduser("~/.claude/telegram_token_stats.json")
 _wechat_proc = None   # wechat_bot.py subprocess
 _tdx_proc = None      # tdx_monitor.py subprocess
 _order_proc = None    # ths_order_monitor.py subprocess
-_conv_history = {}    # key: "<bot_path>:<chat_id>" -> list of {"role": ..., "content": ...}
 
-GLOBAL_CLAUDE_MD = os.path.expanduser("~/.claude/CLAUDE.md")
-LITELLM_BASE_URL = "http://localhost:4000"
 ANTHROPIC_PROXY_URL = "http://localhost:4001"
-
-
-def load_global_context():
-    """Read ~/.claude/CLAUDE.md as global system context."""
-    try:
-        if os.path.exists(GLOBAL_CLAUDE_MD):
-            return open(GLOBAL_CLAUDE_MD, encoding="utf-8").read().strip()
-    except Exception:
-        pass
-    return ""
 
 
 MODELS = [
@@ -246,67 +233,6 @@ def get_api_keys():
     return defaults
 
 
-def _zhipu_jwt(api_key):
-    id_, secret = api_key.split(".", 1)
-    def b64(s):
-        return base64.urlsafe_b64encode(s if isinstance(s, bytes) else s.encode()).rstrip(b"=").decode()
-    header  = b64(json.dumps({"alg": "HS256", "sign_type": "SIGN"}, separators=(",", ":")))
-    ts      = int(time.time() * 1000)
-    payload = b64(json.dumps({"api_key": id_, "exp": ts + 3600000, "timestamp": ts}, separators=(",", ":")))
-    sig     = hmac.new(secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest()
-    return f"{header}.{payload}.{b64(sig)}"
-
-
-def _call_openai_compat(base_url, api_key, model, messages):
-    if not api_key:
-        raise ValueError("API key not configured")
-    data = json.dumps({
-        "model": model,
-        "messages": messages,
-        "max_tokens": 4096,
-        "temperature": 0.7,
-    }).encode()
-    req = urllib.request.Request(
-        f"{base_url}/chat/completions",
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
-    )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        result = json.loads(r.read())
-    content = result["choices"][0]["message"]["content"]
-    usage   = result.get("usage", {})
-    return content, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
-
-
-def call_direct_api(provider, model, messages):
-    """Call non-Claude API directly. Returns (reply_text, in_tokens, out_tokens) or None."""
-    keys = get_api_keys()
-    try:
-        if provider == "deepseek":
-            return _call_openai_compat(
-                "https://api.deepseek.com/v1",
-                keys.get("deepseek", ""), model, messages)
-        elif provider == "zhipu":
-            token = _zhipu_jwt(keys.get("zhipu", ""))
-            return _call_openai_compat(
-                "https://open.bigmodel.cn/api/paas/v4",
-                token, model, messages)
-        elif provider == "minimax":
-            return _call_openai_compat(
-                "https://api.minimax.chat/v1",
-                keys.get("minimax", ""), model, messages)
-        elif provider == "bailian":
-            return _call_openai_compat(
-                "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                keys.get("bailian", ""), model, messages)
-    except Exception as e:
-        print(f"[API] {provider}/{model} error: {e}")
-        return None
-
-
 def update_token_stats(in_tokens, out_tokens):
     stats = {"input": 0, "output": 0}
     if os.path.exists(TOKEN_STATS_FILE):
@@ -328,12 +254,6 @@ def get_token_stats():
             pass
     return {"input": 0, "output": 0}
 
-
-def clear_conv_history(chat_id=None):
-    if chat_id is None:
-        _conv_history.clear()
-    else:
-        _conv_history.pop(str(chat_id), None)
 
 BOT_COMMANDS = [
     {"command": "clear", "description": "Clear conversation"},
@@ -373,10 +293,14 @@ def telegram_api(method, data, token=None):
             with urllib.request.urlopen(req, timeout=15) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
-            # 4xx 不重试（请求本身有错）
             err_body = e.read().decode(errors="ignore")
-            print(f"Telegram API error [{method}]: {e} | {err_body}")
-            return None
+            # 4xx 是请求本身的错，重试也是同样结果；5xx 重试
+            if 400 <= e.code < 500:
+                print(f"Telegram API error [{method}]: {e} | {err_body}")
+                return None
+            last_err = f"HTTP {e.code}: {err_body[:200]}"
+            if attempt < 2:
+                time.sleep(0.8 * (attempt + 1))
         except Exception as e:
             last_err = e
             if attempt < 2:
@@ -393,11 +317,16 @@ def setup_bot_commands():
 
 def send_typing_loop(chat_id, token=None, pending_file=None):
     pf = pending_file or PENDING_FILE
-    while os.path.exists(pf):
-        # Heartbeat: refresh timestamp so stop hook never sees a stale pending file
+    while True:
+        # Atomic heartbeat: open existing file with r+ — if hook just deleted it,
+        # FileNotFoundError is raised and we exit instead of resurrecting the file.
         try:
-            with open(pf, "w") as f:
+            with open(pf, "r+") as f:
+                f.seek(0)
+                f.truncate()
                 f.write(str(int(time.time())))
+        except FileNotFoundError:
+            return
         except Exception:
             pass
         telegram_api("sendChatAction", {"chat_id": chat_id, "action": "typing"}, token=token)
@@ -434,12 +363,17 @@ def tmux_send_enter(session=None):
 
 
 def tmux_send_with_enter(text, session=None):
-    """Send text + Enter reliably using tmux buffer paste."""
+    """Send text + Enter reliably using tmux buffer paste.
+
+    Uses a per-session named buffer + `-d` (delete after paste) so concurrent
+    sends to different sessions cannot clobber each other's payloads.
+    """
     s = session or TMUX_SESSION
     if not tmux_exists(s):
         return
-    subprocess.run(["tmux", "load-buffer", "-"], input=text.encode())
-    subprocess.run(["tmux", "paste-buffer", "-t", s])
+    buf = f"tg_{s}_{threading.get_ident()}"
+    subprocess.run(["tmux", "load-buffer", "-b", buf, "-"], input=text.encode())
+    subprocess.run(["tmux", "paste-buffer", "-d", "-b", buf, "-t", s])
     time.sleep(0.3)
     subprocess.run(["tmux", "send-keys", "-t", s, "Enter"])
 
@@ -483,20 +417,33 @@ def tmux_send_escape(session=None):
 
 
 def get_recent_sessions(limit=5):
+    """Return the most-recent N *distinct* sessions (one entry per sessionId).
+    Each history.jsonl line is a single user input, so without dedup the picker
+    would show 5 prompts from the same session instead of 5 different sessions."""
     if not os.path.exists(HISTORY_FILE):
         return []
-    sessions = []
+    entries = []
     try:
         with open(HISTORY_FILE) as f:
             for line in f:
                 try:
-                    sessions.append(json.loads(line.strip()))
+                    entries.append(json.loads(line.strip()))
                 except:
                     continue
     except:
         return []
-    sessions.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-    return sessions[:limit]
+    entries.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+    seen = set()
+    result = []
+    for e in entries:
+        sid = e.get("sessionId")
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        result.append(e)
+        if len(result) >= limit:
+            break
+    return result
 
 
 def get_session_id(project_path):
@@ -520,6 +467,16 @@ class Handler(BaseHTTPRequestHandler):
         self.profile = self._get_profile()
         self.bot_token = self.profile.get("token") or BOT_TOKEN
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        # Verify Telegram's secret_token header so forged POSTs to our public URL are dropped.
+        # Telegram echoes the secret we passed at setWebhook in every legitimate request.
+        expected_secret = self.profile.get("secret", "")
+        if expected_secret:
+            got = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if got != expected_secret:
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b"unauthorized")
+                return
         try:
             update = json.loads(body)
             if "callback_query" in update:
@@ -550,12 +507,20 @@ class Handler(BaseHTTPRequestHandler):
             set_model(chosen, self.profile.get("model_file"))
             label    = next((l for m, l, *_ in MODELS if m == chosen), chosen)
             provider = get_provider(chosen)
-            self._relaunch_claude_for_model(chat_id, chosen, provider)
-            self.reply(chat_id, f"[{self.profile['name']}] 已切换到 {label}")
+            # Relaunch is slow (~3s tmux dance) — never run on the HTTP handler thread
+            profile = self.profile
+            token   = self.bot_token
+            self.reply(chat_id, f"[{profile['name']}] 已切换到 {label}（正在重启 Claude...）")
+            threading.Thread(
+                target=self._relaunch_for_profile,
+                args=(chat_id, chosen, profile, token),
+                daemon=True
+            ).start()
             return
 
-        # Commands below require tmux
-        if not tmux_exists():
+        # Commands below require this bot's tmux session
+        sess = self.profile.get("tmux_session", TMUX_SESSION)
+        if not tmux_exists(sess):
             self.reply(chat_id, "tmux session not found")
             return
 
@@ -592,7 +557,13 @@ class Handler(BaseHTTPRequestHandler):
         if data.startswith("resume:"):
             session_id = data.split(":", 1)[1]
             self.reply(chat_id, f"Resuming: {session_id[:8]}...")
-            threading.Thread(target=self._do_resume, args=(chat_id, session_id), daemon=True).start()
+            profile = self.profile
+            token   = self.bot_token
+            threading.Thread(
+                target=self._do_resume,
+                args=(chat_id, session_id, profile, token),
+                daemon=True
+            ).start()
 
     def download_file(self, file_id, filename):
         """Download a file from Telegram by file_id, return local file path or None."""
@@ -601,7 +572,6 @@ class Handler(BaseHTTPRequestHandler):
             return None
         file_path = result["result"]["file_path"]
         url = f"https://api.telegram.org/file/bot{self.bot_token}/{file_path}"
-        ext = filename.rsplit(".", 1)[-1] if "." in filename else file_path.rsplit(".", 1)[-1]
         safe_name = filename.replace("/", "_").replace("\\", "_")
         local_path = f"/tmp/{safe_name}"
         try:
@@ -621,7 +591,8 @@ class Handler(BaseHTTPRequestHandler):
         file_path = result["result"]["file_path"]
         url = f"https://api.telegram.org/file/bot{self.bot_token}/{file_path}"
         ext = file_path.rsplit(".", 1)[-1] if "." in file_path else "jpg"
-        local_path = f"/tmp/telegram_photo_{int(time.time())}.{ext}"
+        # nanosecond timestamp avoids same-second collisions when batching photos
+        local_path = f"/tmp/telegram_photo_{time.time_ns()}.{ext}"
         try:
             urllib.request.urlretrieve(url, local_path)
             return local_path
@@ -660,8 +631,6 @@ class Handler(BaseHTTPRequestHandler):
             if ext not in SUPPORTED_EXTS:
                 self.reply(chat_id, f"不支持的文件类型：.{ext}")
                 return
-            with open(_chat_id_file, "w") as f:
-                f.write(str(chat_id))
             local_path = self.download_file(document.get("file_id"), filename)
             if not local_path:
                 self.reply(chat_id, "文件下载失败")
@@ -670,15 +639,13 @@ class Handler(BaseHTTPRequestHandler):
 
         # Photo message
         if photo:
-            with open(_chat_id_file, "w") as f:
-                f.write(str(chat_id))
             local_path = self.download_photo(photo)
             if not local_path:
                 self.reply(chat_id, "图片下载失败")
                 return
             text = f"{caption}\n\n图片路径：{local_path}".strip() if caption else f"图片路径：{local_path}"
 
-        if not text or not chat_id:
+        if not text:
             return
 
         with open(_chat_id_file, "w") as f:
@@ -724,7 +691,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if cmd == "/loop":
-                if not tmux_exists():
+                sess = self.profile.get("tmux_session", TMUX_SESSION)
+                if not tmux_exists(sess):
                     self.reply(chat_id, "tmux not found")
                     return
                 parts = text.split(maxsplit=1)
@@ -736,22 +704,29 @@ class Handler(BaseHTTPRequestHandler):
                 with open(_pending_file, "w") as f:
                     f.write(str(int(time.time())))
                 threading.Thread(target=send_typing_loop, args=(chat_id, self.bot_token, _pending_file), daemon=True).start()
-                tmux_send(f'/ralph-loop:ralph-loop "{full}" --max-iterations 5 --completion-promise "DONE"')
+                tmux_send(f'/ralph-loop:ralph-loop "{full}" --max-iterations 5 --completion-promise "DONE"', session=sess)
                 time.sleep(0.3)
-                tmux_send_enter()
+                tmux_send_enter(sess)
                 self.reply(chat_id, "Ralph Loop started (max 5 iterations)")
                 return
 
             if cmd == "/restart":
                 self.reply(chat_id, "Bridge restarting...")
+                # Record both chat_id AND token so post-restart notify uses the right bot
                 with open(RESTART_NOTIFY_FILE, "w") as f:
-                    f.write(str(chat_id))
+                    f.write(f"{chat_id}\t{self.bot_token}")
                 threading.Thread(target=self._do_restart, daemon=True).start()
                 return
 
             if cmd == "/relaunch":
                 self.reply(chat_id, "Relaunching Claude Code in tmux...")
-                threading.Thread(target=self._do_relaunch, args=(chat_id,), daemon=True).start()
+                profile = self.profile
+                token   = self.bot_token
+                threading.Thread(
+                    target=self._do_relaunch,
+                    args=(chat_id, profile, token),
+                    daemon=True,
+                ).start()
                 return
 
             # ── /gp 统一股票指令 + 兼容旧指令 /tdx /ths /stock ──
@@ -828,9 +803,13 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 kb = []
                 for s in sessions:
-                    sid = get_session_id(s.get("project", ""))
+                    # Prefer sessionId from history.jsonl; fall back to project-dir scan
+                    sid = s.get("sessionId") or get_session_id(s.get("project", ""))
                     if sid:
                         kb.append([{"text": s.get("display", "?")[:40] + "...", "callback_data": f"resume:{sid}"}])
+                if not kb:
+                    self.reply(chat_id, "No resumable sessions")
+                    return
                 telegram_api("sendMessage", {"chat_id": chat_id, "text": "Select session:", "reply_markup": {"inline_keyboard": kb}}, token=self.bot_token)
                 return
 
@@ -891,29 +870,6 @@ class Handler(BaseHTTPRequestHandler):
                 tmux_send_with_enter(txt, session=sess)
             threading.Thread(target=_delayed_send, daemon=True).start()
 
-    def _call_api_and_reply(self, chat_id, text, model, provider, bot_path="/"):
-        hist_key = f"{bot_path}:{chat_id}"
-        history = _conv_history.setdefault(hist_key, [])
-        history.append({"role": "user", "content": text})
-        global_ctx = load_global_context()
-        # Merge: bot system_prompt overrides global CLAUDE.md for specialised bots
-        sys_prompt = self.profile.get("system_prompt") or global_ctx
-        messages = ([{"role": "system", "content": sys_prompt}] if sys_prompt else []) + list(history)
-        result = call_direct_api(provider, model, messages)
-        # Only remove pending file for tmux-routed bots (direct_api bots never set it)
-        pf = self.profile.get("pending_file", PENDING_FILE)
-        if not self.profile.get("direct_api") and os.path.exists(pf):
-            os.remove(pf)
-        if result:
-            reply_text, in_tok, out_tok = result
-            history.append({"role": "assistant", "content": reply_text})
-            if len(history) > 40:
-                history[:] = history[-40:]
-            update_token_stats(in_tok, out_tok)
-            self.reply(chat_id, reply_text)
-        else:
-            self.reply(chat_id, "❌ API 调用失败，请检查 Key 配置")
-
     def _stock_add_watchlist(self, chat_id, code):
         """将股票加入自选列表文件"""
         try:
@@ -945,13 +901,20 @@ class Handler(BaseHTTPRequestHandler):
         prompt = f"帮我分析股票 {code} 的当前走势，包括均线、MACD、RSI、KDJ，给出操作建议"
         tmux_send_with_enter(prompt, session=sess)
 
-    def _relaunch_claude_for_model(self, chat_id, model, provider):
-        """Exit and relaunch THIS bot's Claude session with the new model.
-        Only touches the session/pending file/work_dir bound to self.profile —
-        the other bot's session is untouched."""
-        sess         = self.profile.get("tmux_session", TMUX_SESSION)
-        pending_file = self.profile.get("pending_file", PENDING_FILE)
-        work_dir     = self.profile.get("work_dir")
+    def _relaunch_for_profile(self, chat_id, model, profile=None, token=None):
+        """Exit and relaunch the given bot's Claude session with the new model.
+        Only touches the session/pending file/work_dir bound to `profile` —
+        the other bot's session is untouched.
+
+        `profile`/`token` are passed explicitly so this can be called from a
+        background thread without depending on self.profile / self.bot_token,
+        which are only valid for the duration of one HTTP request."""
+        p = profile if profile is not None else self.profile
+        sess         = p.get("tmux_session", TMUX_SESSION)
+        pending_file = p.get("pending_file", PENDING_FILE)
+        work_dir     = p.get("work_dir")
+        thinking_file = p.get("thinking_file")
+        model_file   = p.get("model_file")
 
         # 清残留 PENDING，否则切完模型再发消息会被 busy-guard 挡住
         if os.path.exists(pending_file):
@@ -982,7 +945,10 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.5)
 
         # 用 paste-buffer 送启动命令；claude_launch_cmd 已预写 approved key，不会弹确认
-        thinking = get_thinking(self.profile.get("thinking_file"))
+        thinking = get_thinking(thinking_file)
+        # ensure the new model is reflected in claude_launch_cmd's lookup path
+        if model_file and model:
+            set_model(model, model_file)
         tmux_send_with_enter(claude_launch_cmd(model, thinking=thinking), session=sess)
 
     # ── 自然语言股票快捷指令 ──────────────────────────────────────────────
@@ -1370,7 +1336,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_trade_approval(self, chat_id, order_id, action="approve", market_price=False):
         """处理交易审批回调（确认/拒绝/改市价）"""
-        sys.path.insert(0, "/mnt/d/cao_stock/scripts")
+        ths_scripts = "/mnt/d/cao_stock/scripts"
+        if ths_scripts not in sys.path:
+            sys.path.insert(0, ths_scripts)
         try:
             from ths_order_monitor import approve_order, reject_order
 
@@ -1391,38 +1359,54 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self.reply(chat_id, f"处理失败: {e}")
 
-    def _do_resume(self, chat_id, session_id):
+    def _do_resume(self, chat_id, session_id, profile=None, token=None):
+        p = profile if profile is not None else self.profile
+        sess          = p.get("tmux_session", TMUX_SESSION)
+        pending_file  = p.get("pending_file", PENDING_FILE)
+        work_dir      = p.get("work_dir")
+        thinking_file = p.get("thinking_file")
+        model_file    = p.get("model_file")
+
         # 清残留 PENDING
-        if os.path.exists(PENDING_FILE):
-            try: os.remove(PENDING_FILE)
+        if os.path.exists(pending_file):
+            try: os.remove(pending_file)
             except: pass
         time.sleep(0.3)
-        tmux_send_escape()
-        time.sleep(0.3)
-        subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-c"])
-        time.sleep(0.5)
-        tmux_send("/exit")
-        tmux_send_enter()
-        time.sleep(2.0)  # Wait for Claude to fully exit before launching resume
-        # 清掉 shell 当前行
-        subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-c"])
-        time.sleep(0.1)
-        subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-u"])
-        time.sleep(0.2)
-        # Re-check: session may have died after /exit
-        if not tmux_exists():
-            subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION], capture_output=True)
+        if tmux_exists(sess):
+            tmux_send_escape(sess)
+            time.sleep(0.3)
+            subprocess.run(["tmux", "send-keys", "-t", sess, "C-c"])
             time.sleep(0.5)
-        tmux_send_with_enter(claude_launch_cmd(extra_args=f" --resume {session_id}", thinking=get_thinking()))
+            tmux_send("/exit", session=sess)
+            tmux_send_enter(sess)
+            time.sleep(2.0)  # Wait for Claude to fully exit before launching resume
+            # 清掉 shell 当前行
+            subprocess.run(["tmux", "send-keys", "-t", sess, "C-c"])
+            time.sleep(0.1)
+            subprocess.run(["tmux", "send-keys", "-t", sess, "C-u"])
+            time.sleep(0.2)
+        # Re-check: session may have died after /exit
+        if not tmux_exists(sess):
+            new_args = ["tmux", "new-session", "-d", "-s", sess]
+            if work_dir:
+                new_args += ["-c", work_dir]
+            subprocess.run(new_args, capture_output=True)
+            time.sleep(0.5)
+        model = get_model(model_file) or "claude-opus-4-7"
+        tmux_send_with_enter(
+            claude_launch_cmd(model, extra_args=f" --resume {session_id}", thinking=get_thinking(thinking_file)),
+            session=sess,
+        )
 
-    def _do_relaunch(self, chat_id):
+    def _do_relaunch(self, chat_id, profile=None, token=None):
         """Kill current Claude Code process in tmux and start a fresh one."""
+        p = profile if profile is not None else self.profile
+        t = token   if token   is not None else self.bot_token
         time.sleep(0.3)
-        cur_model = get_model(self.profile.get("model_file")) or "claude-opus-4-7"
-        cur_provider = get_provider(cur_model)
-        self._relaunch_claude_for_model(chat_id, cur_model, cur_provider)
+        cur_model = get_model(p.get("model_file")) or "claude-opus-4-7"
+        self._relaunch_for_profile(chat_id, cur_model, profile=p, token=t)
         time.sleep(2)
-        telegram_api("sendMessage", {"chat_id": chat_id, "text": f"[{self.profile['name']}] Claude Code relaunched ✓"}, token=self.bot_token)
+        telegram_api("sendMessage", {"chat_id": chat_id, "text": f"[{p['name']}] Claude Code relaunched ✓"}, token=t)
 
     def _do_restart(self):
         time.sleep(0.3)
@@ -1485,13 +1469,13 @@ def _restart_tunnel_and_register():
         if url:
             break
     if url:
-        result = telegram_api("setWebhook", {"url": url})
-        if result and result.get("ok"):
-            print(f"[watchdog] Webhook re-registered: {url}")
-            return url
-        print(f"[watchdog] setWebhook failed: {result}")
-    else:
-        print("[watchdog] Could not get new tunnel URL")
+        # Re-register webhook for EVERY configured bot, not just the main one.
+        # Previously only the main token's webhook was updated, so the stock bot
+        # silently stopped receiving messages after every tunnel restart.
+        _register_all_webhooks(url)
+        print(f"[watchdog] Webhooks re-registered on {url}")
+        return url
+    print("[watchdog] Could not get new tunnel URL")
     return None
 
 
@@ -1508,13 +1492,21 @@ def tunnel_watchdog():
 
 
 def notify_restart_if_needed():
-    if os.path.exists(RESTART_NOTIFY_FILE):
-        try:
-            chat_id = int(open(RESTART_NOTIFY_FILE).read().strip())
-            os.remove(RESTART_NOTIFY_FILE)
-            telegram_api("sendMessage", {"chat_id": chat_id, "text": "Bridge restarted successfully ✓"})
-        except Exception as e:
-            print(f"Restart notify error: {e}")
+    if not os.path.exists(RESTART_NOTIFY_FILE):
+        return
+    try:
+        raw = open(RESTART_NOTIFY_FILE).read().strip()
+        os.remove(RESTART_NOTIFY_FILE)
+        # New format: "chat_id\ttoken"; legacy fallback: bare chat_id (uses BOT_TOKEN)
+        if "\t" in raw:
+            cid_str, token = raw.split("\t", 1)
+            chat_id = int(cid_str)
+        else:
+            chat_id = int(raw)
+            token = None
+        telegram_api("sendMessage", {"chat_id": chat_id, "text": "Bridge restarted successfully ✓"}, token=token)
+    except Exception as e:
+        print(f"Restart notify error: {e}")
 
 
 _anthropic_proxy_proc = None
@@ -1546,14 +1538,18 @@ def _start_anthropic_proxy():
 
 
 def _register_all_webhooks(tunnel_url):
-    """Register webhooks for all configured bots."""
+    """Register webhooks for all configured bots, passing each bot's secret_token."""
     for path, profile in BOT_PROFILES.items():
         token = profile.get("token", "")
         if not token:
             continue
         suffix = "" if path == "/" else path
         webhook_url = f"{tunnel_url}{suffix}"
-        result = telegram_api("setWebhook", {"url": webhook_url}, token=token)
+        payload = {"url": webhook_url}
+        secret = profile.get("secret", "")
+        if secret:
+            payload["secret_token"] = secret
+        result = telegram_api("setWebhook", payload, token=token)
         ok = result and result.get("ok")
         print(f"  [{profile['name']}] webhook {webhook_url} → {'OK' if ok else 'FAIL'}")
         if ok:
@@ -1565,9 +1561,12 @@ def main():
         print("Error: TELEGRAM_BOT_TOKEN not set")
         return
 
-    # Fill runtime tokens into BOT_PROFILES
-    BOT_PROFILES["/"]["token"]      = BOT_TOKEN
-    BOT_PROFILES["/stock"]["token"] = STOCK_BOT_TOKEN
+    # Fill runtime tokens + per-bot webhook secrets into BOT_PROFILES.
+    # Telegram's secret_token allows [A-Za-z0-9_-], 1..256 chars; token_urlsafe gives that.
+    BOT_PROFILES["/"]["token"]       = BOT_TOKEN
+    BOT_PROFILES["/"]["secret"]      = secrets.token_urlsafe(32)
+    BOT_PROFILES["/stock"]["token"]  = STOCK_BOT_TOKEN
+    BOT_PROFILES["/stock"]["secret"] = secrets.token_urlsafe(32)
 
     notify_restart_if_needed()
     _start_anthropic_proxy()
