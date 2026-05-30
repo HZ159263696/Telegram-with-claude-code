@@ -37,7 +37,7 @@ BOTS = {
         "pending_file": os.path.expanduser("~/.claude/telegram_pending"),
         "chat_id_file":os.path.expanduser("~/.claude/telegram_chat_id"),
         "work_dir":     None,
-        "default_model":"claude-opus-4-7",
+        "default_model":"claude-opus-4-8",
         "bridge_managed": True,   # 走 bridge.py，接收全局 bridge 日志
     },
     "stock": {
@@ -69,7 +69,7 @@ def _bot_or_default(key):
     return BOTS.get(key, BOTS["main"])
 
 # Claude model provider detection
-_CLAUDE_MODELS = {"claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
+_CLAUDE_MODELS = {"claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
 # Non-Claude models need CLI alias for LiteLLM routing
 _CLI_MODEL_ALIAS = {
     "deepseek-v4-flash": "claude-3-5-sonnet-20241022",
@@ -98,6 +98,7 @@ _THINK_BUDGET = {
 }
 # 每个模型支持哪些思考档位（前端只渲染这里列出的档位；空 = 不显示思考切换）
 _MODEL_THINK = {
+    "claude-opus-4-8":           ["medium", "high", "xhigh", "max"],
     "claude-opus-4-7":           ["medium", "high", "xhigh", "max"],
     "claude-sonnet-4-6":         ["medium", "high", "xhigh", "max"],
     "claude-haiku-4-5-20251001": [],
@@ -912,6 +913,8 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
 .badge-smart{background:rgba(0,212,255,.12);color:var(--accent);border:1px solid rgba(0,212,255,.2)}
 .badge-reason{background:rgba(255,180,0,.12);color:#ffb400;border:1px solid rgba(255,180,0,.2)}
 .badge-cheap{background:rgba(150,100,255,.12);color:#b080ff;border:1px solid rgba(150,100,255,.2)}
+.badge-new{background:rgba(255,80,80,.15);color:#ff6060;border:1px solid rgba(255,80,80,.3);animation:badgePulse 2s ease-in-out infinite}
+@keyframes badgePulse{0%,100%{opacity:1}50%{opacity:.6}}
 .badge-think{background:rgba(255,180,0,.10);color:#ffb400;border:1px solid rgba(255,180,0,.18)}
 .divider{height:1px;background:var(--border);margin:0 20px}
 
@@ -1070,6 +1073,7 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
 
 <script>
 const MODELS=[
+  {id:"claude-opus-4-8",  name:"Claude Opus 4.8",    prov:"Anthropic", icon:"🟣", desc:"旗舰最新，顶级推理能力",  badge:"new",    badgeTxt:"NEW",   think:["medium","high","xhigh","max"]},
   {id:"claude-opus-4-7",  name:"Claude Opus 4.7",    prov:"Anthropic", icon:"🟣", desc:"最强推理，复杂任务首选",  badge:"smart",  badgeTxt:"SMART", think:["medium","high","xhigh","max"]},
   {id:"claude-sonnet-4-6",name:"Claude Sonnet 4.6",  prov:"Anthropic", icon:"🔵", desc:"均衡性能，日常主力",      badge:"fast",   badgeTxt:"FAST",  think:["medium","high","xhigh","max"]},
   {id:"claude-haiku-4-5-20251001",name:"Claude Haiku 4.5",prov:"Anthropic",icon:"⚪",desc:"超快响应，轻量任务",   badge:"cheap",  badgeTxt:"LITE",  think:[]},

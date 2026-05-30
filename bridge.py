@@ -79,7 +79,8 @@ ANTHROPIC_PROXY_URL = "http://localhost:4001"
 
 MODELS = [
     # (model_id, display_label, provider, has_thinking)
-    ("claude-opus-4-7",           "Opus 4.7 — 最强",         "claude",   True),
+    ("claude-opus-4-8",           "Opus 4.8 — 旗舰最新",      "claude",   True),
+    ("claude-opus-4-7",           "Opus 4.7 — 最强",          "claude",   True),
     ("claude-sonnet-4-6",         "Sonnet 4.6 — 均衡",        "claude",   True),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — 最快",         "claude",   False),
     ("deepseek-v4-flash",         "DeepSeek V4 Flash — 经济",  "deepseek", True),
@@ -92,7 +93,7 @@ MODELS = [
 ]
 
 PROVIDERS = {
-    "claude":   ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    "claude":   ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
     "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro"],
     "zhipu":    ["glm-4-plus", "glm-4-flash"],
     "minimax":  ["abab6.5s-chat"],
@@ -145,6 +146,7 @@ THINKING_FILE = os.path.expanduser("~/.claude/telegram_thinking")
 THINK_BUDGET = {"medium": 8000, "high": 16000, "xhigh": 24000, "max": 31999}
 # 每个模型支持哪些思考档位（与 dashboard.py 的 _MODEL_THINK 保持一致）
 MODEL_THINK = {
+    "claude-opus-4-8":           ["medium", "high", "xhigh", "max"],
     "claude-opus-4-7":           ["medium", "high", "xhigh", "max"],
     "claude-sonnet-4-6":         ["medium", "high", "xhigh", "max"],
     "claude-haiku-4-5-20251001": [],
@@ -185,7 +187,7 @@ def claude_launch_cmd(model=None, extra_args="", thinking=None):
     """Build the full claude launch command, with ANTHROPIC_BASE_URL for non-Claude models.
 
     thinking: 思考档位 id（medium/high/xhigh/max）；对支持的模型注入 MAX_THINKING_TOKENS。"""
-    m = model or get_model() or "claude-opus-4-7"
+    m = model or get_model() or "claude-opus-4-8"
     provider = get_provider(m)
     think_pre = think_env_prefix(m, thinking)
     if provider == "claude":
@@ -742,7 +744,7 @@ class Handler(BaseHTTPRequestHandler):
             cmd = text.split()[0].lower()
 
             if cmd == "/status":
-                cur_model = get_model(self.profile.get("model_file")) or "claude-opus-4-7"
+                cur_model = get_model(self.profile.get("model_file")) or "claude-opus-4-8"
                 cur_label = next((l for m, l, *_ in MODELS if m == cur_model), cur_model)
                 cur_provider = get_provider(cur_model)
                 sess = self.profile.get("tmux_session", TMUX_SESSION)
@@ -874,7 +876,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if cmd == "/model":
-                current = get_model(self.profile.get("model_file")) or "claude-opus-4-7"
+                current = get_model(self.profile.get("model_file")) or "claude-opus-4-8"
                 kb = [[{"text": f"{'✓ ' if current == m else ''}{label}", "callback_data": f"model:{m}"}] for m, label, *_ in MODELS]
                 telegram_api("sendMessage", {
                     "chat_id": chat_id,
@@ -916,7 +918,7 @@ class Handler(BaseHTTPRequestHandler):
         tmux_sess    = self.profile.get("tmux_session", TMUX_SESSION)
         pending_file = self.profile.get("pending_file", PENDING_FILE)
         chat_id_file = self.profile.get("chat_id_file", CHAT_ID_FILE)
-        model        = get_model(self.profile.get("model_file")) or "claude-opus-4-7"
+        model        = get_model(self.profile.get("model_file")) or "claude-opus-4-8"
         provider     = get_provider(model)
 
         # Write chat_id for this bot's hook to pick up
@@ -1479,7 +1481,7 @@ class Handler(BaseHTTPRequestHandler):
                 new_args += ["-c", work_dir]
             subprocess.run(new_args, capture_output=True)
             time.sleep(0.5)
-        model = get_model(model_file) or "claude-opus-4-7"
+        model = get_model(model_file) or "claude-opus-4-8"
         tmux_send_with_enter(
             claude_launch_cmd(model, extra_args=f" --resume {session_id}", thinking=get_thinking(thinking_file)),
             session=sess,
@@ -1490,7 +1492,7 @@ class Handler(BaseHTTPRequestHandler):
         p = profile if profile is not None else self.profile
         t = token   if token   is not None else self.bot_token
         time.sleep(0.3)
-        cur_model = get_model(p.get("model_file")) or "claude-opus-4-7"
+        cur_model = get_model(p.get("model_file")) or "claude-opus-4-8"
         self._relaunch_for_profile(chat_id, cur_model, profile=p, token=t)
         time.sleep(2)
         telegram_api("sendMessage", {"chat_id": chat_id, "text": f"[{p['name']}] Claude Code relaunched ✓"}, token=t)
