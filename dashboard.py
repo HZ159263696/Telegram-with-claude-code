@@ -68,6 +68,116 @@ BOTS = {
 def _bot_or_default(key):
     return BOTS.get(key, BOTS["main"])
 
+
+# ── 主动大脑 (proactive) + 记忆 (memory) ──────────────────────────────────────
+PROACTIVE_SCRIPT  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proactive.py")
+PROACTIVE_CONFIG  = os.path.expanduser("~/.claude/proactive_config.json")
+PROACTIVE_STATE   = os.path.expanduser("~/.claude/proactive_state.json")
+MEM_ROOT          = os.path.expanduser("~/.claude/memory")
+MEM_FILES         = ["MEMORY.md", "PROJECTS.md", "PENDING.md", "RECENT.md"]
+# 默认值需与 proactive.py 的 DEFAULT_BOT / DEFAULT_ENABLED 保持一致（per-bot 配置）
+PROACTIVE_BOT_DEFAULT = {
+    "interval_min": 30, "quiet_start": 23, "quiet_end": 8,
+    "min_gap_hours": 4, "max_per_day": 4, "min_idle_hours": 2,
+    "brain_model": "claude-haiku-4-5-20251001",
+    "optimize_enabled": True, "optimize_model": "",
+}
+PROACTIVE_DEFAULT_ENABLED = {"main": True, "stock": False, "feishu": False}
+
+
+def _read_json(path, default):
+    if os.path.exists(path):
+        try:
+            return json.load(open(path, encoding="utf-8"))
+        except Exception:
+            pass
+    return dict(default) if isinstance(default, dict) else default
+
+
+def _proactive_running():
+    try:
+        r = subprocess.run(["pgrep", "-f", "proactive.py"], capture_output=True, text=True)
+        return bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
+def _bot_proactive_cfg(raw, bot):
+    """某个 bot 的最终主动配置 = 默认 + enabled 默认 + 文件覆盖。"""
+    b = dict(PROACTIVE_BOT_DEFAULT)
+    b["enabled"] = PROACTIVE_DEFAULT_ENABLED.get(bot, False)
+    if isinstance(raw, dict) and isinstance(raw.get(bot), dict):
+        b.update(raw[bot])
+    return b
+
+
+def get_proactive(bot):
+    bot = bot if bot in BOTS else "main"
+    raw = _read_json(PROACTIVE_CONFIG, {})
+    state = _read_json(PROACTIVE_STATE, {})
+    return {"bot": bot, "config": _bot_proactive_cfg(raw, bot),
+            "state": state.get(bot, {}) if isinstance(state, dict) else {},
+            "running": _proactive_running()}
+
+
+def save_proactive_config(bot, data):
+    """合并保存某个 bot 的配置，只接受已知键并做类型校验。"""
+    bot = bot if bot in BOTS else "main"
+    raw = _read_json(PROACTIVE_CONFIG, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    cur = _bot_proactive_cfg(raw, bot)
+    if "enabled" in data:
+        cur["enabled"] = bool(data["enabled"])
+    for k in ("interval_min", "quiet_start", "quiet_end",
+              "min_gap_hours", "max_per_day", "min_idle_hours"):
+        if k in data:
+            try:
+                cur[k] = int(data[k])
+            except Exception:
+                pass
+    if data.get("brain_model"):
+        cur["brain_model"] = str(data["brain_model"])
+    if "optimize_enabled" in data:
+        cur["optimize_enabled"] = bool(data["optimize_enabled"])
+    if "optimize_model" in data:
+        cur["optimize_model"] = str(data["optimize_model"] or "")
+    raw[bot] = cur
+    with open(PROACTIVE_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    return cur
+
+
+def trigger_proactive(bot, mode):
+    """手动触发某个 bot 一次：once=守规则；force=跳过判断强制发一条。"""
+    bot = bot if bot in BOTS else "main"
+    flag = "--force" if mode == "force" else "--once"
+    out = open("/tmp/proactive.out", "a")
+    subprocess.Popen(["python3", PROACTIVE_SCRIPT, flag, "--bot", bot],
+                     stdout=out, stderr=subprocess.STDOUT)
+    return {"ok": True, "mode": mode, "bot": bot}
+
+
+def get_memory(bot):
+    bot = bot if bot in BOTS else "main"
+    d = os.path.join(MEM_ROOT, bot)
+    files = {}
+    for fn in MEM_FILES:
+        p = os.path.join(d, fn)
+        files[fn] = open(p, encoding="utf-8").read() if os.path.exists(p) else ""
+    return {"bot": bot, "files": files}
+
+
+def save_memory(bot, fn, content):
+    bot = bot if bot in BOTS else "main"
+    if fn not in MEM_FILES:
+        return {"ok": False, "error": "bad file"}
+    d = os.path.join(MEM_ROOT, bot)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, fn), "w", encoding="utf-8") as f:
+        f.write(content)
+    return {"ok": True}
+
 # Claude model provider detection
 _CLAUDE_MODELS = {"claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
 # Non-Claude models need CLI alias for LiteLLM routing
@@ -1055,6 +1165,62 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
   </div>
 </details>
 
+<!-- Proactive Brain 主动大脑 -->
+<details>
+  <summary>
+    <span style="font-size:14px">🧠</span>
+    主动大脑（自己找我）
+    <span id="proState" style="margin-left:auto;font-size:12px;letter-spacing:0;opacity:.75">…</span>
+  </summary>
+  <div class="keys-body">
+    <div class="kr"><label>后台主动</label>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="p-enabled" style="width:18px;height:18px">
+        <span style="font-size:13px;opacity:.8">开启 = 定时判断要不要主动找你</span>
+      </label>
+    </div>
+    <div class="kr"><label>判断间隔</label><span><input id="p-interval" type="number" min="1" style="width:70px"> 分钟</span></div>
+    <div class="kr"><label>静默时段</label><span><input id="p-qs" type="number" min="0" max="23" style="width:56px"> 到 <input id="p-qe" type="number" min="0" max="23" style="width:56px"> 点不打扰</span></div>
+    <div class="kr"><label>最小间隔</label><span><input id="p-gap" type="number" min="0" style="width:70px"> 小时</span></div>
+    <div class="kr"><label>每天上限</label><span><input id="p-max" type="number" min="0" style="width:70px"> 条</span></div>
+    <div class="kr"><label>刚聊完静默</label><span><input id="p-idle" type="number" min="0" style="width:70px"> 小时内不插话</span></div>
+    <div class="kr"><label>大脑模型</label>
+      <select id="p-model" style="flex:1;padding:6px;border-radius:8px">
+        <option value="claude-haiku-4-5-20251001">Haiku 4.5（快·省额度）</option>
+        <option value="claude-sonnet-4-6">Sonnet 4.6（均衡）</option>
+        <option value="claude-opus-4-8">Opus 4.8（最强）</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+      <button class="save-btn" style="flex:1;min-width:120px" onclick="saveProactive()">保存配置</button>
+      <button class="log-btn" onclick="runProactive('once')">测试(守规则)</button>
+      <button class="log-btn" onclick="runProactive('force')">强制发一条</button>
+    </div>
+    <div id="proInfo" style="font-size:12px;opacity:.65;margin-top:8px;line-height:1.6"></div>
+  </div>
+</details>
+
+<!-- Memory 记忆 -->
+<details>
+  <summary>
+    <span style="font-size:14px">📔</span>
+    记忆（当前 Bot）
+    <span style="margin-left:auto;font-size:13px;letter-spacing:0">▾</span>
+  </summary>
+  <div class="keys-body">
+    <div class="kr"><label>文件</label>
+      <select id="m-file" onchange="showMemFile()" style="flex:1;padding:6px;border-radius:8px">
+        <option value="MEMORY.md">MEMORY · 长期事实/偏好</option>
+        <option value="PROJECTS.md">PROJECTS · 进行中项目</option>
+        <option value="PENDING.md">PENDING · 待办与承诺</option>
+        <option value="RECENT.md">RECENT · 最近对话</option>
+      </select>
+    </div>
+    <textarea id="m-text" spellcheck="false" style="width:100%;min-height:200px;margin-top:8px;padding:10px;border-radius:8px;font-family:monospace;font-size:12px;line-height:1.5;box-sizing:border-box;resize:vertical"></textarea>
+    <button class="save-btn" onclick="saveMemory()">保存到当前 Bot 记忆</button>
+  </div>
+</details>
+
 <!-- Model Picker Sheet -->
 <div class="sheet-overlay" id="sheetOverlay" onclick="closeSheet()"></div>
 <div class="sheet" id="sheet">
@@ -1111,6 +1277,8 @@ function switchBot(bot){
   if(_pollTimer){clearTimeout(_pollTimer);_pollTimer=null;_usePolling=false;}
   fetchStatus();
   startSSE();
+  loadMemory();
+  loadProactive();
   toast("已切换到 "+(BOT_NAMES[bot]||bot));
 }
 
@@ -1303,6 +1471,78 @@ async function loadKeys(){
     if(d.bailian) document.getElementById("k-bl").value=d.bailian;
   }catch(e){}
 }
+
+// ── 主动大脑 ──────────────────────────────────────────────────────────────────
+async function loadProactive(){
+  try{
+    const d=await (await fetch("/api/proactive?bot="+curBot)).json();
+    const c=d.config||{};
+    document.getElementById("p-enabled").checked=!!c.enabled;
+    document.getElementById("p-interval").value=c.interval_min;
+    document.getElementById("p-qs").value=c.quiet_start;
+    document.getElementById("p-qe").value=c.quiet_end;
+    document.getElementById("p-gap").value=c.min_gap_hours;
+    document.getElementById("p-max").value=c.max_per_day;
+    document.getElementById("p-idle").value=c.min_idle_hours;
+    if(c.brain_model)document.getElementById("p-model").value=c.brain_model;
+    const run=d.running;
+    const badge=document.getElementById("proState");
+    badge.textContent=(BOT_NAMES[curBot]||curBot)+"："+(c.enabled?(run?"开 ●":"开·进程未运行"):"关");
+    badge.style.color=c.enabled?(run?"#34d399":"#fbbf24"):"#9ca3af";
+    const st=d.state||{};
+    let info=["当前编辑："+(BOT_NAMES[curBot]||curBot)+"（每个 Bot 独立配置）"];
+    if(st.sent_today!=null)info.push("今日已主动 "+st.sent_today+" 次");
+    if(st.last_sent_ts)info.push("上次 "+new Date(st.last_sent_ts*1000).toLocaleString());
+    if(st.last_proactive)info.push("内容：“"+st.last_proactive+"”");
+    document.getElementById("proInfo").textContent=info.join("  ·  ");
+  }catch(e){}
+}
+async function saveProactive(){
+  const body={
+    bot:curBot,
+    enabled:document.getElementById("p-enabled").checked,
+    interval_min:+document.getElementById("p-interval").value,
+    quiet_start:+document.getElementById("p-qs").value,
+    quiet_end:+document.getElementById("p-qe").value,
+    min_gap_hours:+document.getElementById("p-gap").value,
+    max_per_day:+document.getElementById("p-max").value,
+    min_idle_hours:+document.getElementById("p-idle").value,
+    brain_model:document.getElementById("p-model").value,
+  };
+  try{
+    const r=await fetch("/api/proactive",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const d=await r.json();toast(d.ok?("["+(BOT_NAMES[curBot]||curBot)+"] 主动配置已保存 ✓"):"保存失败");loadProactive();
+  }catch(e){toast("请求失败");}
+}
+async function runProactive(mode){
+  toast("["+(BOT_NAMES[curBot]||curBot)+"] "+(mode==="force"?"正在强制生成一条…":"正在判断要不要主动…"));
+  try{
+    await fetch("/api/proactive/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({bot:curBot,mode})});
+    setTimeout(loadProactive,5000);
+  }catch(e){toast("请求失败");}
+}
+
+// ── 记忆 ──────────────────────────────────────────────────────────────────────
+let _mem={};
+async function loadMemory(){
+  try{
+    const d=await (await fetch("/api/memory?bot="+curBot)).json();
+    _mem=d.files||{};showMemFile();
+  }catch(e){}
+}
+function showMemFile(){
+  const fn=document.getElementById("m-file").value;
+  document.getElementById("m-text").value=(_mem[fn]!=null?_mem[fn]:"");
+}
+async function saveMemory(){
+  const fn=document.getElementById("m-file").value;
+  const content=document.getElementById("m-text").value;
+  try{
+    const r=await fetch("/api/memory",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({bot:curBot,file:fn,content})});
+    const d=await r.json();
+    if(d.ok){_mem[fn]=content;toast("记忆已保存 ✓");}else{toast("保存失败");}
+  }catch(e){toast("请求失败");}
+}
 let _sse=null;
 let _sseReconnect=null;
 let _sseFails=0;         // consecutive SSE failures
@@ -1437,7 +1677,8 @@ if(initM)updateTrigger(initM);
 document.querySelectorAll(".bot-tab").forEach(el=>{
   el.classList.toggle("active",el.dataset.bot===curBot);
 });
-fetchStatus();loadKeys();
+fetchStatus();loadKeys();loadProactive();loadMemory();
+setInterval(loadProactive,15000);
 // 先拉一次快照，立即显示历史日志（防止 SSE 被云端缓冲时面板空白）
 fetch("/api/logs/snapshot?bot="+curBot+"&since=0")
   .then(r=>r.json())
@@ -1499,6 +1740,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/keys":
             self._json(get_api_keys())
 
+        elif path == "/api/proactive":
+            self._json(get_proactive(self._query_bot()))
+
+        elif path == "/api/memory":
+            self._json(get_memory(self._query_bot()))
+
         else:
             self.send_response(404)
             self.send_header("Content-Length", "0")
@@ -1547,6 +1794,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 save_api_keys(data)
                 self._json({"ok": True})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+
+        elif path == "/api/proactive":
+            try:
+                bot = data.get("bot") or self._query_bot()
+                self._json({"ok": True, "config": save_proactive_config(bot, data)})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+
+        elif path == "/api/proactive/run":
+            try:
+                bot = data.get("bot") or self._query_bot()
+                self._json(trigger_proactive(bot, data.get("mode", "once")))
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+
+        elif path == "/api/memory":
+            try:
+                self._json(save_memory(data.get("bot", "main"),
+                                       data.get("file", ""), data.get("content", "")))
             except Exception as e:
                 self._json({"ok": False, "error": str(e)})
 

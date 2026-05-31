@@ -2,6 +2,13 @@
 """Claude Code Stop hook - sends response back to Telegram or Feishu"""
 import sys, os, json, re, time, urllib.request, urllib.error
 
+# 共享记忆层（best-effort，缺失/出错都不影响回复发送）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import memory_lib
+except Exception:
+    memory_lib = None
+
 LOG = "/tmp/hook_debug.log"
 TOKEN_STATS_FILE = os.path.expanduser("~/.claude/telegram_token_stats.json")
 
@@ -158,6 +165,29 @@ def main():
         log("no user message found")
         return
 
+    # 找最近一条「人类」用户消息（跳过 tool_result），仅用于写记忆
+    human_user_text = ""
+    for _line in reversed(lines):
+        try:
+            _o = json.loads(_line)
+        except Exception:
+            continue
+        if _o.get("type") != "user":
+            continue
+        _c = _o.get("message", {}).get("content", "")
+        if isinstance(_c, str):
+            human_user_text = _c
+            break
+        if isinstance(_c, list):
+            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in _c):
+                continue
+            human_user_text = " ".join(
+                b.get("text", "") for b in _c
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+            if human_user_text:
+                break
+
     texts = []
     total_in, total_out = 0, 0
     for line in lines[last_user_idx + 1:]:
@@ -175,6 +205,7 @@ def main():
             continue
 
     text = "\n\n".join(texts).strip()
+    assistant_raw = text   # 写记忆用：保留未经 HTML 转换的原文
     log(f"extracted: len={len(text)} preview={text[:100]}")
 
     if not text:
@@ -247,6 +278,15 @@ def main():
             log(f"token stats updated: in={total_in} out={total_out}")
         except Exception as e:
             log(f"token stats error: {e}")
+
+    # ── 写记忆（best-effort）：把本轮压成摘要追加进 RECENT.md ──────────────────
+    if memory_lib is not None:
+        try:
+            mem_bot = memory_lib.resolve_bot("", transcript_path)
+            memory_lib.append_recent(mem_bot, human_user_text, assistant_raw)
+            log(f"memory appended: bot={mem_bot}")
+        except Exception as e:
+            log(f"memory write error: {e}")
 
     os.remove(PENDING_FILE)
     log("done")

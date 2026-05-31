@@ -63,12 +63,12 @@ if [ -n "$TMUX" ]; then
         [ -z "$SAVED_MODEL" ] && SAVED_MODEL="claude-opus-4-7"
     fi
 
-    # Determine if model needs LiteLLM proxy
-    CLAUDE_MODELS="claude-opus-4-7 claude-sonnet-4-6 claude-haiku-4-5-20251001"
-    IS_CLAUDE=false
-    for cm in $CLAUDE_MODELS; do
-        [ "$SAVED_MODEL" = "$cm" ] && IS_CLAUDE=true
-    done
+    # Claude 模型（claude-* 开头）直连 Anthropic；其它（deepseek/glm/minimax/qwen）走本地代理。
+    # 用前缀判断而非硬编码列表，避免每次新增 Claude 模型（如 opus-4-8）漏改导致误走代理。
+    case "$SAVED_MODEL" in
+        claude-*) IS_CLAUDE=true ;;
+        *)        IS_CLAUDE=false ;;
+    esac
 
     if $IS_CLAUDE; then
         tmux new-session -d -s claude "claude --dangerously-skip-permissions --model $SAVED_MODEL"
@@ -184,6 +184,12 @@ if [ -n "$TMUX" ]; then
     pkill -f "feishu_bridge.py" 2>/dev/null; sleep 0.3
     nohup python3 "$PROJECT/feishu_bridge.py" > /tmp/feishu_bridge.log 2>&1 &
     echo "    Feishu bridge started (log: /tmp/feishu_bridge.log)"
+
+    # 5.5 Start Proactive Brain (主动大脑：定时用 claude -p 订阅判断是否主动找用户)
+    echo "[6.5] Starting Proactive Brain..."
+    pkill -f "proactive.py" 2>/dev/null; sleep 0.3
+    nohup python3 "$PROJECT/proactive.py" > /tmp/proactive.out 2>&1 &
+    echo "    Proactive brain started (log: /tmp/proactive.log)"
 
     # 4. Bridge is managed by dashboard (auto-start on dashboard launch)
     echo "[5] Bridge managed by dashboard on port $PORT."

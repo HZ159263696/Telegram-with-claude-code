@@ -347,11 +347,19 @@ def tmux_exists(session=None):
     return s in r.stdout.split()
 
 
+def _pane(session=None):
+    """全限定 pane 目标 'session:0.0'。
+    必须用全限定写法：三个 session 的窗口都叫 'claude'（tmux 用启动命令名命名窗口），
+    且 'claude' 是 'claude_feishu'/'claude_stock' 的前缀，无冒号的 '-t claude' 会被
+    tmux 解析成"最近活跃的名为 claude 的窗口"，导致主控消息误投到飞书/股票 session。"""
+    return f"{session or TMUX_SESSION}:0.0"
+
+
 def tmux_send(text, literal=True, session=None):
     s = session or TMUX_SESSION
     if not tmux_exists(s):
         return
-    cmd = ["tmux", "send-keys", "-t", s]
+    cmd = ["tmux", "send-keys", "-t", _pane(s)]
     if literal:
         cmd.append("-l")
     cmd.append(text)
@@ -362,7 +370,7 @@ def tmux_send_enter(session=None):
     s = session or TMUX_SESSION
     if not tmux_exists(s):
         return
-    subprocess.run(["tmux", "send-keys", "-t", s, "Enter"])
+    subprocess.run(["tmux", "send-keys", "-t", _pane(s), "Enter"])
 
 
 def tmux_send_with_enter(text, session=None):
@@ -376,9 +384,9 @@ def tmux_send_with_enter(text, session=None):
         return
     buf = f"tg_{s}_{threading.get_ident()}"
     subprocess.run(["tmux", "load-buffer", "-b", buf, "-"], input=text.encode())
-    subprocess.run(["tmux", "paste-buffer", "-d", "-b", buf, "-t", s])
+    subprocess.run(["tmux", "paste-buffer", "-d", "-b", buf, "-t", _pane(s)])
     time.sleep(0.3)
-    subprocess.run(["tmux", "send-keys", "-t", s, "Enter"])
+    subprocess.run(["tmux", "send-keys", "-t", _pane(s), "Enter"])
 
 
 CLAUDE_JSON_PATH = os.path.expanduser("~/.claude.json")
@@ -416,7 +424,7 @@ def tmux_send_escape(session=None):
     s = session or TMUX_SESSION
     if not tmux_exists(s):
         return
-    subprocess.run(["tmux", "send-keys", "-t", s, "Escape"])
+    subprocess.run(["tmux", "send-keys", "-t", _pane(s), "Escape"])
 
 
 def get_recent_sessions(limit=5):
@@ -1014,15 +1022,15 @@ class Handler(BaseHTTPRequestHandler):
             # Escape 退出 Claude UI，C-c 中断任何 shell 前台进程
             tmux_send_escape(sess)
             time.sleep(0.2)
-            subprocess.run(["tmux", "send-keys", "-t", sess, "C-c"])
+            subprocess.run(["tmux", "send-keys", "-t", _pane(sess), "C-c"])
             time.sleep(0.3)
             tmux_send("/exit", session=sess)
             tmux_send_enter(sess)
             time.sleep(1.5)
             # 清掉 shell 当前行（防止历史里残留的 claude --resume 被错误回车）
-            subprocess.run(["tmux", "send-keys", "-t", sess, "C-c"])
+            subprocess.run(["tmux", "send-keys", "-t", _pane(sess), "C-c"])
             time.sleep(0.1)
-            subprocess.run(["tmux", "send-keys", "-t", sess, "C-u"])
+            subprocess.run(["tmux", "send-keys", "-t", _pane(sess), "C-u"])
             time.sleep(0.2)
 
         # Re-check: session may have died after /exit (tmux kills session when initial command exits)
@@ -1464,15 +1472,15 @@ class Handler(BaseHTTPRequestHandler):
         if tmux_exists(sess):
             tmux_send_escape(sess)
             time.sleep(0.3)
-            subprocess.run(["tmux", "send-keys", "-t", sess, "C-c"])
+            subprocess.run(["tmux", "send-keys", "-t", _pane(sess), "C-c"])
             time.sleep(0.5)
             tmux_send("/exit", session=sess)
             tmux_send_enter(sess)
             time.sleep(2.0)  # Wait for Claude to fully exit before launching resume
             # 清掉 shell 当前行
-            subprocess.run(["tmux", "send-keys", "-t", sess, "C-c"])
+            subprocess.run(["tmux", "send-keys", "-t", _pane(sess), "C-c"])
             time.sleep(0.1)
-            subprocess.run(["tmux", "send-keys", "-t", sess, "C-u"])
+            subprocess.run(["tmux", "send-keys", "-t", _pane(sess), "C-u"])
             time.sleep(0.2)
         # Re-check: session may have died after /exit
         if not tmux_exists(sess):
