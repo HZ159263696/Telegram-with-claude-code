@@ -20,6 +20,28 @@ MODEL_FILE       = os.path.expanduser("~/.claude/telegram_model")
 TOKEN_STATS_FILE = os.path.expanduser("~/.claude/telegram_token_stats.json")
 PENDING_FILE     = os.path.expanduser("~/.claude/telegram_pending")
 API_KEYS_FILE    = os.path.expanduser("~/.claude/telegram_api_keys.json")
+WEBHOOK_TOKEN_FILE   = os.path.expanduser("~/.claude/dashboard_webhook_token.txt")
+
+# ── 远程 routine 可触发的本地任务白名单 ───────────────────────────────────────
+# 通过 POST /api/spawn/<key> + Authorization: Bearer <token> 调用。
+# - daemon (长驻): 已在跑则返回 pid，未跑则启动后台进程
+# - oneshot (一次性): 每次都启动新进程，跑完自然退出，不检查已运行
+SPAWN_TASKS = {
+    "price_monitor": {
+        "script":  "/mnt/d/cao_stock/scripts/monitor/price_monitor.py",
+        "cwd":     "/mnt/d/cao_stock",
+        "log":     "/mnt/d/cao_stock/data/price_monitor.log",
+        "match":   "monitor/price_monitor.py",
+        "oneshot": False,
+    },
+    "end_of_day_report": {
+        "script":  "/mnt/d/cao_stock/scripts/analysis/end_of_day_report.py",
+        "cwd":     "/mnt/d/cao_stock",
+        "log":     "/mnt/d/cao_stock/data/end_of_day_report.log",
+        "match":   "analysis/end_of_day_report.py",
+        "oneshot": True,
+    },
+}
 LTLOG            = "/tmp/lt_bridge.log"
 CHAT_ID_FILE     = os.path.expanduser("~/.claude/telegram_chat_id")
 TMUX_SESSION     = os.environ.get("TMUX_SESSION", "claude")
@@ -37,7 +59,7 @@ BOTS = {
         "pending_file": os.path.expanduser("~/.claude/telegram_pending"),
         "chat_id_file":os.path.expanduser("~/.claude/telegram_chat_id"),
         "work_dir":     None,
-        "default_model":"claude-opus-4-8",
+        "default_model":"claude-fable-5",
         "bridge_managed": True,   # 走 bridge.py，接收全局 bridge 日志
     },
     "stock": {
@@ -100,6 +122,92 @@ def _proactive_running():
         return bool(r.stdout.strip())
     except Exception:
         return False
+
+
+def _load_or_create_webhook_token():
+    """读取或生成 dashboard webhook token。供 routine 等外部触发 endpoint 鉴权。"""
+    p = WEBHOOK_TOKEN_FILE
+    try:
+        if os.path.exists(p):
+            t = open(p, encoding="utf-8").read().strip()
+            if t:
+                return t
+    except Exception:
+        pass
+    import secrets
+    t = secrets.token_urlsafe(24)
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(t + "\n")
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+    return t
+
+
+WEBHOOK_TOKEN = _load_or_create_webhook_token()
+
+
+def _spawn_task_running(match_pattern):
+    """返回命令行匹配 match_pattern 且以 python 开头的进程 pid（首个），无则 ''。
+
+    pgrep -af 拿命令行后过滤 head 必须是 python 可执行，避免 bash 命令字符串
+    里碰巧含同样字符串被误命中。
+    """
+    try:
+        r = subprocess.run(["pgrep", "-af", match_pattern],
+                           capture_output=True, text=True)
+        for line in r.stdout.strip().splitlines():
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            pid, cmdline = parts
+            head = cmdline.lstrip().split(None, 1)[0]
+            if os.path.basename(head).startswith("python"):
+                return pid
+        return ""
+    except Exception:
+        return ""
+
+
+def spawn_task(task_key):
+    """按白名单启动一个本地任务。返回 JSON 状态。"""
+    cfg = SPAWN_TASKS.get(task_key)
+    if not cfg:
+        return {"ok": False, "error": f"unknown task: {task_key}",
+                "available": sorted(SPAWN_TASKS.keys())}
+
+    script = cfg["script"]
+    if not os.path.exists(script):
+        return {"ok": False, "error": f"script not found: {script}"}
+
+    if not cfg.get("oneshot"):
+        pid = _spawn_task_running(cfg["match"])
+        if pid:
+            return {"ok": True, "task": task_key, "already_running": True, "pid": int(pid)}
+
+    try:
+        log_path = cfg.get("log") or f"/tmp/spawn-{task_key}.log"
+        try:
+            log = open(log_path, "a", encoding="utf-8", errors="replace")
+        except Exception:
+            log_path = f"/tmp/spawn-{task_key}.log"
+            log = open(log_path, "a", encoding="utf-8", errors="replace")
+        proc = subprocess.Popen(
+            ["python3", "-u", script, *cfg.get("args", [])],
+            stdout=log, stderr=subprocess.STDOUT,
+            cwd=cfg.get("cwd") or os.path.dirname(script),
+            start_new_session=True,
+        )
+        time.sleep(1.0)
+        if proc.poll() is not None and not cfg.get("oneshot"):
+            return {"ok": False, "task": task_key,
+                    "error": f"process exited rc={proc.returncode}; see {log_path}"}
+        return {"ok": True, "task": task_key, "already_running": False,
+                "pid": proc.pid, "log": log_path,
+                "oneshot": bool(cfg.get("oneshot"))}
+    except Exception as e:
+        return {"ok": False, "task": task_key, "error": str(e)}
 
 
 def _bot_proactive_cfg(raw, bot):
@@ -179,7 +287,7 @@ def save_memory(bot, fn, content):
     return {"ok": True}
 
 # Claude model provider detection
-_CLAUDE_MODELS = {"claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
+_CLAUDE_MODELS = {"claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
 # Non-Claude models need CLI alias for LiteLLM routing
 _CLI_MODEL_ALIAS = {
     "deepseek-v4-flash": "claude-3-5-sonnet-20241022",
@@ -208,8 +316,8 @@ _THINK_BUDGET = {
 }
 # 每个模型支持哪些思考档位（前端只渲染这里列出的档位；空 = 不显示思考切换）
 _MODEL_THINK = {
+    "claude-fable-5":            ["medium", "high", "xhigh", "max"],
     "claude-opus-4-8":           ["medium", "high", "xhigh", "max"],
-    "claude-opus-4-7":           ["medium", "high", "xhigh", "max"],
     "claude-sonnet-4-6":         ["medium", "high", "xhigh", "max"],
     "claude-haiku-4-5-20251001": [],
     "deepseek-v4-pro":           ["medium", "high", "xhigh", "max"],
@@ -527,6 +635,142 @@ def _log_claude(line, bot_key="main"):
     _push_log(bot_key, entry)
 
 
+# ── Transcript tail: 结构化 Claude 实时输出（思考/回复/工具 分离）──────────────
+# 直接 tail 各 Bot 的 transcript JSONL（含结构化 thinking/text/tool_use 块），
+# 取代 tmux 抓屏：无 ANSI 噪音、无去重 hack，前端可按 Claude 桌面端风格分开渲染。
+CLAUDE_EVT_MARK = "@@CLAUDE@@"   # SSE 行前缀，前端据此解析 JSON 并结构化渲染
+_tail_states = {k: {"path": None, "offset": 0} for k in BOTS}
+
+
+def _session_cwd(session):
+    """读 tmux session 里进程的真实 cwd（决定 transcript 落在哪个 projects 子目录）。"""
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-t", f"{session}:0.0", "-F", "#{pane_pid}"],
+                           capture_output=True, text=True)
+        pid = r.stdout.strip().split()[0]
+        return os.readlink(f"/proc/{pid}/cwd")
+    except Exception:
+        return None
+
+
+def _transcript_dir(profile):
+    cwd = (_session_cwd(profile.get("tmux_session"))
+           or profile.get("work_dir") or "/mnt/d/AI/claudecode-telegram-main")
+    enc = re.sub(r"[^a-zA-Z0-9]", "-", cwd)   # Claude Code 把 cwd 非字母数字转 '-'
+    return os.path.expanduser(f"~/.claude/projects/{enc}")
+
+
+def _newest_transcript(profile):
+    d = _transcript_dir(profile)
+    try:
+        files = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".jsonl")]
+        return max(files, key=os.path.getmtime) if files else None
+    except Exception:
+        return None
+
+
+def _emit_claude_event(bot_key, kind, text):
+    text = (text or "").strip()
+    if not text:
+        return
+    evt = {"k": kind, "ts": time.strftime("%H:%M:%S"), "t": text[:4000]}
+    _push_log(bot_key, CLAUDE_EVT_MARK + json.dumps(evt, ensure_ascii=False))
+
+
+def _summarize_tool_input(inp):
+    """工具调用参数取一个最有代表性的字段做单行摘要。"""
+    if not isinstance(inp, dict):
+        return ""
+    for key in ("command", "description", "file_path", "pattern", "prompt",
+                "url", "query", "skill", "path"):
+        v = inp.get(key)
+        if isinstance(v, str) and v.strip():
+            return " ".join(v.split())[:120]
+    return ""
+
+
+def _handle_transcript_line(bot_key, line):
+    try:
+        obj = json.loads(line)
+    except Exception:
+        return
+    t = obj.get("type")
+    content = (obj.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return
+    if t == "assistant":
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            if bt == "thinking":
+                _emit_claude_event(bot_key, "think", b.get("thinking", ""))
+            elif bt == "text":
+                _emit_claude_event(bot_key, "text", b.get("text", ""))
+            elif bt == "tool_use":
+                name = b.get("name", "?")
+                arg = _summarize_tool_input(b.get("input"))
+                _emit_claude_event(bot_key, "tool", f"{name}({arg})" if arg else name)
+    elif t == "user":
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                c = b.get("content")
+                if isinstance(c, str):
+                    snippet = c
+                elif isinstance(c, list):
+                    snippet = " ".join(x.get("text", "") for x in c
+                                       if isinstance(x, dict) and x.get("type") == "text")
+                else:
+                    snippet = ""
+                snippet = " ".join(snippet.split())
+                if snippet:
+                    _emit_claude_event(bot_key, "result", snippet[:160])
+
+
+def _tail_one_bot(bot_key):
+    profile = _bot_or_default(bot_key)
+    st = _tail_states[bot_key]
+    path = _newest_transcript(profile)
+    if not path:
+        return
+    if path != st["path"]:
+        # 新 transcript：dashboard 刚启动时跳过历史避免刷屏；之后出现的新文件从头读
+        st["offset"] = os.path.getsize(path) if st["path"] is None else 0
+        st["path"] = path
+    try:
+        size = os.path.getsize(path)
+        if size < st["offset"]:
+            st["offset"] = 0          # 文件被截断/重写
+        if size == st["offset"]:
+            return
+        with open(path, "rb") as f:
+            f.seek(st["offset"])
+            data = f.read()
+    except Exception:
+        return
+    end = data.rfind(b"\n")
+    if end < 0:
+        return                        # 只有半行，等下一轮
+    for raw in data[:end].split(b"\n"):
+        line = raw.decode("utf-8", "replace").strip()
+        if line:
+            try:
+                _handle_transcript_line(bot_key, line)
+            except Exception:
+                pass
+    st["offset"] += end + 1
+
+
+def _transcript_tail_loop():
+    while True:
+        for bot_key in BOTS:
+            try:
+                _tail_one_bot(bot_key)
+            except Exception:
+                pass
+        time.sleep(1)
+
+
 def start_bridge():
     global _bridge_proc, _bridge_start_time
     if _bridge_proc and _bridge_proc.poll() is None:
@@ -538,10 +782,10 @@ def start_bridge():
     subprocess.call(["fuser", "-k", f"{bridge_port}/tcp"], stderr=subprocess.DEVNULL)
     import time as _t; _t.sleep(0.5)  # wait for port to free
     env = os.environ.copy()
-    # Reset token stats on each bridge start
+    # Reset token stats on each bridge start（per-bot 分桶格式，空 = 全部清零）
     try:
         with open(TOKEN_STATS_FILE, "w") as f:
-            json.dump({"input": 0, "output": 0}, f)
+            json.dump({}, f)
     except Exception:
         pass
     _bridge_proc = subprocess.Popen(
@@ -588,11 +832,17 @@ def get_status(bot_key="main"):
         except Exception:
             pass
 
-    # Token 统计目前是全局的（bridge.py 没分桶），暂保留共用
+    # Token 统计：per-bot 分桶（send-to-telegram.py 写入），兼容旧扁平格式
     tokens = {"input": 0, "output": 0}
     if os.path.exists(TOKEN_STATS_FILE):
         try:
-            tokens = json.load(open(TOKEN_STATS_FILE))
+            raw = json.load(open(TOKEN_STATS_FILE))
+            if isinstance(raw.get("input"), int):
+                # 旧扁平格式：全算主控Bot 的
+                if bot_key == "main":
+                    tokens = {"input": raw.get("input", 0), "output": raw.get("output", 0)}
+            elif isinstance(raw.get(bot_key), dict):
+                tokens = raw[bot_key]
         except Exception:
             pass
 
@@ -882,6 +1132,20 @@ body::after{
 #log-output .ll{padding:0;color:#4a6a90}
 #log-output .ll.new{color:var(--text3)}
 #log-output .ll.claude{color:#e0a040;font-weight:500}
+/* ── Claude 结构化输出（思考/回复/工具 分离，仿桌面端）── */
+#log-output .ll.cl-text{color:#e8eef6;font-weight:500;white-space:pre-wrap;margin:7px 0;line-height:1.65}
+#log-output .ll.cl-text .cl-dot{color:#34d399;margin-right:4px}
+#log-output .ll.cl-tool{color:#56a8d6;margin-top:5px}
+#log-output .ll.cl-result{color:#44617f;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-left:14px}
+#log-output .ll.cl-think{margin:7px 0}
+#log-output .ll.cl-think summary{cursor:pointer;color:#9d8cff;font-style:italic;list-style:none;user-select:none}
+#log-output .ll.cl-think summary::-webkit-details-marker{display:none}
+#log-output .ll.cl-think summary:hover{color:#bdb0ff}
+#log-output .ll.cl-think .cl-ts{opacity:.55;font-size:10px;font-style:normal}
+#log-output .ll.cl-think .cl-think-body{
+  color:#857fa6;font-style:italic;white-space:pre-wrap;
+  border-left:2px solid #3a3560;padding:2px 0 2px 9px;margin:4px 0 4px 3px;line-height:1.6;
+}
 
 /* ── Fullscreen log ── */
 .log-panel.fullscreen{
@@ -921,6 +1185,13 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
   color:var(--text);outline:none;transition:border-color .2s;
 }
 .kr input:focus{border-color:var(--accent)}
+.kr .eye{
+  flex-shrink:0;width:32px;height:32px;display:flex;align-items:center;justify-content:center;
+  background:var(--bg);border:1px solid var(--border);border-radius:7px;cursor:pointer;
+  font-size:14px;line-height:1;color:var(--text2);transition:border-color .2s,color .2s;
+  user-select:none;padding:0;
+}
+.kr .eye:hover{border-color:var(--accent);color:var(--text)}
 .save-btn{
   background:linear-gradient(135deg,var(--accent2),var(--accent));
   color:#000;border:none;border-radius:8px;
@@ -1157,10 +1428,10 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
     <span style="margin-left:auto;font-size:13px;letter-spacing:0">▾</span>
   </summary>
   <div class="keys-body">
-    <div class="kr"><label>DeepSeek</label><input id="k-ds" type="password" placeholder="sk-..."></div>
-    <div class="kr"><label>智谱AI</label><input id="k-zp" type="password" placeholder="id.secret"></div>
-    <div class="kr"><label>MiniMax</label><input id="k-mm" type="password" placeholder="sk-api-..."></div>
-    <div class="kr"><label>百炼</label><input id="k-bl" type="password" placeholder="sk-..."></div>
+    <div class="kr"><label>DeepSeek</label><input id="k-ds" type="password" placeholder="sk-..."><span class="eye" onclick="toggleKey(this)" title="显示/隐藏">👁</span></div>
+    <div class="kr"><label>智谱AI</label><input id="k-zp" type="password" placeholder="id.secret"><span class="eye" onclick="toggleKey(this)" title="显示/隐藏">👁</span></div>
+    <div class="kr"><label>MiniMax</label><input id="k-mm" type="password" placeholder="sk-api-..."><span class="eye" onclick="toggleKey(this)" title="显示/隐藏">👁</span></div>
+    <div class="kr"><label>百炼</label><input id="k-bl" type="password" placeholder="sk-..."><span class="eye" onclick="toggleKey(this)" title="显示/隐藏">👁</span></div>
     <button class="save-btn" onclick="saveKeys()">保存 API Keys</button>
   </div>
 </details>
@@ -1188,7 +1459,8 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
       <select id="p-model" style="flex:1;padding:6px;border-radius:8px">
         <option value="claude-haiku-4-5-20251001">Haiku 4.5（快·省额度）</option>
         <option value="claude-sonnet-4-6">Sonnet 4.6（均衡）</option>
-        <option value="claude-opus-4-8">Opus 4.8（最强）</option>
+        <option value="claude-opus-4-8">Opus 4.8（最强 Opus）</option>
+        <option value="claude-fable-5">Fable 5（最新旗舰）</option>
       </select>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
@@ -1239,8 +1511,8 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
 
 <script>
 const MODELS=[
-  {id:"claude-opus-4-8",  name:"Claude Opus 4.8",    prov:"Anthropic", icon:"🟣", desc:"旗舰最新，顶级推理能力",  badge:"new",    badgeTxt:"NEW",   think:["medium","high","xhigh","max"]},
-  {id:"claude-opus-4-7",  name:"Claude Opus 4.7",    prov:"Anthropic", icon:"🟣", desc:"最强推理，复杂任务首选",  badge:"smart",  badgeTxt:"SMART", think:["medium","high","xhigh","max"]},
+  {id:"claude-fable-5",   name:"Claude Fable 5",     prov:"Anthropic", icon:"✨", desc:"最新旗舰，顶级推理能力",  badge:"new",    badgeTxt:"NEW",   think:["medium","high","xhigh","max"]},
+  {id:"claude-opus-4-8",  name:"Claude Opus 4.8",    prov:"Anthropic", icon:"🟣", desc:"最强 Opus，复杂任务首选", badge:"smart",  badgeTxt:"SMART", think:["medium","high","xhigh","max"]},
   {id:"claude-sonnet-4-6",name:"Claude Sonnet 4.6",  prov:"Anthropic", icon:"🔵", desc:"均衡性能，日常主力",      badge:"fast",   badgeTxt:"FAST",  think:["medium","high","xhigh","max"]},
   {id:"claude-haiku-4-5-20251001",name:"Claude Haiku 4.5",prov:"Anthropic",icon:"⚪",desc:"超快响应，轻量任务",   badge:"cheap",  badgeTxt:"LITE",  think:[]},
   {id:"deepseek-v4-flash",name:"DeepSeek V4 Flash",   prov:"DeepSeek",  icon:"🐋", desc:"经济快速，1M 上下文",    badge:"fast",   badgeTxt:"FAST",  think:["medium","high"]},
@@ -1270,13 +1542,13 @@ function switchBot(bot){
   document.querySelectorAll(".bot-tab").forEach(el=>{
     el.classList.toggle("active",el.dataset.bot===bot);
   });
-  // 清空当前日志并重连 SSE 拉新 Bot 的内容
+  // 清空当前日志，按当前可用模式重连拉新 Bot 的内容（不强切 SSE，避免反复失败弹窗）
   document.getElementById("log-output").innerHTML="";
-  _pollSeq=0;
+  _pollSeq=0;_sseSeq=0;
   if(_sse){try{_sse.close();}catch(e){}_sse=null;}
-  if(_pollTimer){clearTimeout(_pollTimer);_pollTimer=null;_usePolling=false;}
+  stopPolling();
   fetchStatus();
-  startSSE();
+  if(_usePolling){startPolling(true);probeSSE();}else{startSSE();}
   loadMemory();
   loadProactive();
   toast("已切换到 "+(BOT_NAMES[bot]||bot));
@@ -1450,6 +1722,11 @@ async function switchModel(model,m,thinking){
     fetchStatus();
   }catch(e){toast("请求失败");}
 }
+function toggleKey(btn){
+  const inp=btn.previousElementSibling;
+  if(inp.type==="password"){inp.type="text";btn.textContent="🙈";}
+  else{inp.type="password";btn.textContent="👁";}
+}
 async function saveKeys(){
   const keys={
     deepseek:document.getElementById("k-ds").value,
@@ -1549,17 +1826,46 @@ let _sseFails=0;         // consecutive SSE failures
 let _pollTimer=null;     // polling fallback timer
 let _pollSeq=0;          // last seen log seq for polling
 let _sseSeq=0;           // last seen seq from SSE (for resume-after-reconnect)
-let _usePolling=false;   // fallback mode flag
+let _usePolling=(localStorage.getItem("logTransport")==="poll");   // 记住上次可用的传输模式，下次进页面零等待
 
+function _esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+// Claude transcript 结构化事件（@@CLAUDE@@ 前缀 + JSON）→ 仿桌面端分块渲染
+function _renderClaudeEvt(jsonStr,first){
+  let e;try{e=JSON.parse(jsonStr);}catch(err){return null;}
+  const d=document.createElement("div");
+  const base="ll"+(first?"":" new");
+  if(e.k==="think"){
+    d.className=base+" cl-think";
+    d.innerHTML='<details><summary>✻ 思考过程 <span class="cl-ts">'+_esc(e.ts||"")+' · '+(e.t||"").length+'字</span></summary><div class="cl-think-body">'+_esc(e.t)+'</div></details>';
+  }else if(e.k==="text"){
+    d.className=base+" cl-text";
+    d.innerHTML='<span class="cl-dot">●</span>'+_esc(e.t);
+  }else if(e.k==="tool"){
+    d.className=base+" cl-tool";
+    d.textContent="⏺ "+e.t;
+  }else if(e.k==="result"){
+    d.className=base+" cl-result";
+    d.textContent="⎿ "+e.t;
+  }else{
+    d.className=base;d.textContent=e.t||"";
+  }
+  return d;
+}
 function _appendLog(text,first){
   const logEl=document.getElementById("log-output");
   if(paused)return;
   const atBottom=(logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight)<40;
-  const div=document.createElement("div");
-  const isClaude=text.includes("] [Claude] ")||text.startsWith("                    ");
-  div.className="ll"+(first?"":" new")+(isClaude?" claude":"");
+  let div;
+  if(text.startsWith("@@CLAUDE@@")){
+    div=_renderClaudeEvt(text.slice(10),first);
+    if(!div)return;
+  }else{
+    div=document.createElement("div");
+    const isClaude=text.includes("] [Claude] ")||text.startsWith("                    ");
+    div.className="ll"+(first?"":" new")+(isClaude?" claude":"");
+    div.textContent=text;
+  }
   div.style.opacity="0";div.style.transition="opacity .5s ease";
-  div.textContent=text;
   logEl.appendChild(div);
   requestAnimationFrame(()=>requestAnimationFrame(()=>div.style.opacity="1"));
   while(logEl.children.length>500){
@@ -1575,15 +1881,19 @@ function stopPolling(){
   if(_pollTimer){clearTimeout(_pollTimer);_pollTimer=null;}
 }
 
-function startPolling(){
+function startPolling(silent){
   stopPolling();
+  // 已在轮询模式（记忆恢复）或静默调用时不弹提示
+  if(!silent&&!_usePolling)toast("SSE不可用，已切换轮询模式");
   _usePolling=true;
-  toast("SSE不可用，已切换轮询模式");
+  localStorage.setItem("logTransport","poll");
   function poll(){
     _pollTimer=null;
+    if(!_usePolling)return;  // 已切回 SSE，丢弃在途轮询
     fetch("/api/logs/snapshot?bot="+curBot+"&since="+_pollSeq)
       .then(r=>r.json())
       .then(d=>{
+        if(!_usePolling)return;
         if(d.lines&&d.lines.length>0){
           d.lines.forEach(t=>_appendLog(t,false));
         }
@@ -1592,6 +1902,27 @@ function startPolling(){
       }).catch(()=>{ _pollTimer=setTimeout(poll,3000); });
   }
   poll();
+}
+
+// 轮询模式下后台静默探测 SSE：真能通才切回，全程无感知、不弹窗
+function probeSSE(){
+  if(!_usePolling)return;
+  let es;
+  try{es=new EventSource("/api/logs?bot="+curBot+"&since="+_pollSeq);}catch(e){return;}
+  const timer=setTimeout(()=>{try{es.close();}catch(e){}},3500);
+  const ok=()=>{
+    clearTimeout(timer);
+    try{es.close();}catch(e){}
+    if(!_usePolling)return;
+    stopPolling();
+    _usePolling=false;
+    localStorage.setItem("logTransport","sse");
+    _sseFails=0;_sseSeq=_pollSeq;
+    startSSE();
+  };
+  es.onmessage=ok;
+  es.addEventListener("ping",ok);
+  es.onerror=()=>{clearTimeout(timer);try{es.close();}catch(e){}};
 }
 
 function startSSE(){
@@ -1609,7 +1940,12 @@ function startSSE(){
       startPolling();
     }
   },3000);
-  function resetAlive(){clearTimeout(aliveTimer);}
+  let marked=false;
+  function resetAlive(){
+    clearTimeout(aliveTimer);
+    // 收到真实数据才认定 SSE 可用并记忆，下次进页面直接走 SSE
+    if(!marked){marked=true;localStorage.setItem("logTransport","sse");}
+  }
   es.onmessage=(e)=>{
     if(es!==_sse)return;
     resetAlive();_sseFails=0;
@@ -1636,16 +1972,14 @@ function startSSE(){
 // 页面重新可见时重置并重连，保证实时日志不中断
 document.addEventListener("visibilitychange",()=>{
   if(!document.hidden){
-    _sseFails=0;
     if(_usePolling){
-      // 从轮询切回 SSE
-      stopPolling();
-      _usePolling=false;
-      _sseSeq=_pollSeq;  // 继续从上次轮询到的位置接
-      startSSE();
-      toast("已重新连接实时日志");
-    } else if(!_sse){
-      startSSE();
+      // 轮询模式不再强切 SSE（之前每次切回页面都重试失败→弹窗）
+      // 改为后台静默探测，真通了才无感切回
+      if(!_pollTimer)startPolling(true);
+      probeSSE();
+    } else {
+      _sseFails=0;
+      if(!_sse)startSSE();
     }
   }
 });
@@ -1687,7 +2021,15 @@ fetch("/api/logs/snapshot?bot="+curBot+"&since=0")
     if(d.seq){_sseSeq=d.seq;_pollSeq=d.seq;}
   })
   .catch(()=>{})
-  .finally(()=>startSSE());
+  .finally(()=>{
+    if(_usePolling){
+      // 上次是轮询模式：直接开轮询（零等待、不弹窗），后台静默探测 SSE
+      startPolling(true);
+      probeSSE();
+    }else{
+      startSSE();
+    }
+  });
 setInterval(fetchStatus,3000);
 </script>
 </body>
@@ -1818,6 +2160,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"ok": False, "error": str(e)})
 
+        elif path.startswith("/api/spawn/") or path == "/api/spawn-price-monitor":
+            auth = self.headers.get("Authorization", "")
+            if auth != "Bearer " + WEBHOOK_TOKEN:
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":false,"error":"unauthorized"}')
+                return
+            # 旧 endpoint 兼容：自动映射到 price_monitor
+            task_key = "price_monitor" if path == "/api/spawn-price-monitor" \
+                       else path[len("/api/spawn/"):]
+            self._json(spawn_task(task_key))
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -1858,9 +2213,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             bot_key = "main"
 
         # 2KB padding comment to break Cloudflare/proxy buffer
+        # + immediate ping: front-end kills SSE if nothing arrives in 3s,
+        #   and comment lines don't fire EventSource events
         try:
             padding = ": " + ("x" * 2046) + "\n\n"
             self.wfile.write(padding.encode())
+            self.wfile.write(b"event: ping\ndata: \n\n")
             self.wfile.flush()
         except Exception:
             return
@@ -1919,8 +2277,9 @@ def main():
         print("⚠  TELEGRAM_BOT_TOKEN not set — bridge won't start without it")
     else:
         start_bridge()  # auto-start bridge on dashboard launch
-    # Start tmux capture thread for Claude Code live output
-    threading.Thread(target=_tmux_capture_loop, daemon=True).start()
+    # 结构化 Claude 实时输出：tail transcript JSONL（思考/输出/工具分离）
+    # 取代旧的 tmux 抓屏（_tmux_capture_loop 保留备用，不再默认启动）
+    threading.Thread(target=_transcript_tail_loop, daemon=True).start()
     print(f"Dashboard → http://localhost:{DASHBOARD_PORT}")
     print(f"Bridge script: {BRIDGE_SCRIPT}")
     try:

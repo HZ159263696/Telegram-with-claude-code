@@ -79,8 +79,8 @@ ANTHROPIC_PROXY_URL = "http://localhost:4001"
 
 MODELS = [
     # (model_id, display_label, provider, has_thinking)
-    ("claude-opus-4-8",           "Opus 4.8 — 旗舰最新",      "claude",   True),
-    ("claude-opus-4-7",           "Opus 4.7 — 最强",          "claude",   True),
+    ("claude-fable-5",            "Fable 5 — 最新旗舰",       "claude",   True),
+    ("claude-opus-4-8",           "Opus 4.8 — 最强 Opus",     "claude",   True),
     ("claude-sonnet-4-6",         "Sonnet 4.6 — 均衡",        "claude",   True),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — 最快",         "claude",   False),
     ("deepseek-v4-flash",         "DeepSeek V4 Flash — 经济",  "deepseek", True),
@@ -93,7 +93,7 @@ MODELS = [
 ]
 
 PROVIDERS = {
-    "claude":   ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    "claude":   ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
     "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro"],
     "zhipu":    ["glm-4-plus", "glm-4-flash"],
     "minimax":  ["abab6.5s-chat"],
@@ -146,8 +146,8 @@ THINKING_FILE = os.path.expanduser("~/.claude/telegram_thinking")
 THINK_BUDGET = {"medium": 8000, "high": 16000, "xhigh": 24000, "max": 31999}
 # 每个模型支持哪些思考档位（与 dashboard.py 的 _MODEL_THINK 保持一致）
 MODEL_THINK = {
+    "claude-fable-5":            ["medium", "high", "xhigh", "max"],
     "claude-opus-4-8":           ["medium", "high", "xhigh", "max"],
-    "claude-opus-4-7":           ["medium", "high", "xhigh", "max"],
     "claude-sonnet-4-6":         ["medium", "high", "xhigh", "max"],
     "claude-haiku-4-5-20251001": [],
     "deepseek-v4-pro":           ["medium", "high", "xhigh", "max"],
@@ -187,7 +187,7 @@ def claude_launch_cmd(model=None, extra_args="", thinking=None):
     """Build the full claude launch command, with ANTHROPIC_BASE_URL for non-Claude models.
 
     thinking: 思考档位 id（medium/high/xhigh/max）；对支持的模型注入 MAX_THINKING_TOKENS。"""
-    m = model or get_model() or "claude-opus-4-8"
+    m = model or get_model() or "claude-fable-5"
     provider = get_provider(m)
     think_pre = think_env_prefix(m, thinking)
     if provider == "claude":
@@ -236,27 +236,8 @@ def get_api_keys():
     return defaults
 
 
-def update_token_stats(in_tokens, out_tokens):
-    stats = {"input": 0, "output": 0}
-    if os.path.exists(TOKEN_STATS_FILE):
-        try:
-            stats = json.load(open(TOKEN_STATS_FILE))
-        except Exception:
-            pass
-    stats["input"]  = stats.get("input", 0)  + in_tokens
-    stats["output"] = stats.get("output", 0) + out_tokens
-    with open(TOKEN_STATS_FILE, "w") as f:
-        json.dump(stats, f)
-
-
-def get_token_stats():
-    if os.path.exists(TOKEN_STATS_FILE):
-        try:
-            return json.load(open(TOKEN_STATS_FILE))
-        except Exception:
-            pass
-    return {"input": 0, "output": 0}
-
+# Token 统计由 hooks/send-to-telegram.py 写入（per-bot 分桶格式），
+# dashboard.get_status 读取；bridge 不再直接读写。
 
 BOT_COMMANDS = [
     {"command": "clear", "description": "Clear conversation"},
@@ -334,6 +315,114 @@ def send_typing_loop(chat_id, token=None, pending_file=None):
             pass
         telegram_api("sendChatAction", {"chat_id": chat_id, "action": "typing"}, token=token)
         time.sleep(4)
+
+
+# ── 回复轮询（替代不稳定的 Stop 钩子）────────────────────────────────────────
+# Claude Code 2.1.x 的 Stop 钩子时灵时不灵（"Failed with non-blocking status
+# code: No stderr output"，脚本根本不执行）。这里 bridge 自己轮询每个 bot 的
+# transcript：检测到回合结束（transcript 写入停止 + 最后一条是 assistant 文本）
+# 就调用 send-to-telegram.py 把回复发出去，不再依赖那个钩子。
+HOOK_SCRIPT     = os.path.expanduser("~/.claude/hooks/send-to-telegram.py")
+POLL_INTERVAL   = 2      # 轮询间隔（秒）
+REPLY_IDLE_SECS = 4      # transcript 多少秒不变才算回合结束
+_poll_last_mtime = {}    # tmux_session -> 已处理过的 transcript mtime（防重发）
+
+
+def _session_cwd(session):
+    """读 tmux session 里 Claude 进程的真实 cwd（决定 transcript 落在哪个 projects 子目录）。"""
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-t", f"{session}:0.0", "-F", "#{pane_pid}"],
+                           capture_output=True, text=True)
+        pid = r.stdout.strip().split()[0]
+        return os.readlink(f"/proc/{pid}/cwd")
+    except Exception:
+        return None
+
+
+def _transcript_dir(profile):
+    """该 bot 的 Claude transcript 目录（~/.claude/projects/<编码后的 cwd>）。
+    用 session 的真实 cwd 而非配置值，避免 session 启动时 cwd 与配置不一致导致找错目录。"""
+    cwd = (_session_cwd(profile.get("tmux_session"))
+           or profile.get("work_dir") or "/mnt/d/AI/claudecode-telegram-main")
+    enc = re.sub(r'[^a-zA-Z0-9]', '-', cwd)   # Claude Code 把 cwd 非字母数字都转成 '-'
+    return os.path.expanduser(f"~/.claude/projects/{enc}")
+
+
+def _newest_transcript(profile):
+    d = _transcript_dir(profile)
+    try:
+        files = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".jsonl")]
+        return max(files, key=os.path.getmtime) if files else None
+    except Exception:
+        return None
+
+
+def _last_is_assistant_text(jsonl):
+    """最后一条有意义的消息是否为 assistant 文本（= 回合真的产出了回复）。"""
+    try:
+        lines = open(jsonl, encoding="utf-8").readlines()
+    except Exception:
+        return False
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        t = o.get("type")
+        if t == "assistant":
+            for b in o.get("message", {}).get("content", []):
+                if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                    return True
+            return False            # assistant 但只有 tool_use → 回合还没结束
+        if t == "user":
+            return False            # 最后是 user → 还没回复
+    return False
+
+
+def _poll_reply(profile):
+    pf = profile.get("pending_file")
+    if not pf or not os.path.exists(pf):
+        return                      # 没有待回复的请求
+    j = _newest_transcript(profile)
+    if not j:
+        return
+    mt = os.path.getmtime(j)
+    sess = profile["tmux_session"]
+    if time.time() - mt < REPLY_IDLE_SECS:
+        return                      # transcript 还在写，回合未结束
+    if mt <= _poll_last_mtime.get(sess, 0):
+        return                      # 没有新内容（已处理过的旧回复）
+    if not _last_is_assistant_text(j):
+        return                      # 回合结束在 tool_use/user，没有可发的文本
+    _poll_last_mtime[sess] = mt
+    try:
+        subprocess.run(["python3", HOOK_SCRIPT],
+                       input=json.dumps({"transcript_path": j}).encode(),
+                       timeout=30)
+        print(f"[poller] {profile['name']} 回合结束，已触发回复发送")
+    except Exception as e:
+        print(f"[poller] {profile['name']} 发送失败: {e}")
+
+
+def reply_poller():
+    # 启动时把现有 transcript 标记为已处理，避免误发上一轮的旧回复
+    for prof in BOT_PROFILES.values():
+        if not prof.get("token"):
+            continue
+        j = _newest_transcript(prof)
+        _poll_last_mtime[prof["tmux_session"]] = os.path.getmtime(j) if j else 0
+    while True:
+        time.sleep(POLL_INTERVAL)
+        for prof in BOT_PROFILES.values():
+            if not prof.get("token"):
+                continue
+            try:
+                _poll_reply(prof)
+            except Exception as e:
+                print(f"[poller] error: {e}")
 
 
 def tmux_exists(session=None):
@@ -572,8 +661,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header(h, v)
             self.end_headers()
 
+            # SSE 必须用 read1：read(8192) 会阻塞攒满 8KB 才返回，
+            # 小事件被缓冲导致前端 3s 内收不到 ping 而误判 SSE 不可用
+            is_sse_resp = "text/event-stream" in (resp.getheader("Content-Type") or "")
             while True:
-                chunk = resp.read(8192)
+                chunk = resp.read1(8192) if is_sse_resp else resp.read(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -661,6 +753,169 @@ class Handler(BaseHTTPRequestHandler):
                 args=(chat_id, session_id, profile, token),
                 daemon=True
             ).start()
+            return
+
+        if data.startswith("auq:"):
+            # AskUserQuestion 按钮回调 — 方案 C
+            # 格式：auq:{nonce}:{qi}:{oi|other}
+            self._handle_auq_callback(chat_id, data, cb)
+            return
+
+    # ── AskUserQuestion 按钮回调处理 ───────────────────────────────────────
+    def _handle_auq_callback(self, chat_id, data, cb):
+        try:
+            _, nonce, qi_s, oi_s = data.split(":", 3)
+            qi = int(qi_s)
+        except Exception:
+            return
+
+        state_file = os.path.expanduser(f"~/.claude/ask_pending/{nonce}.json")
+        if not os.path.exists(state_file):
+            self.reply(chat_id, "⏰ 这次问答已过期或被回收，请等太子重发")
+            return
+
+        try:
+            with open(state_file) as f:
+                state = json.load(f)
+        except Exception:
+            return
+
+        if state.get("cursor", 0) != qi:
+            # 防重复点
+            return
+
+        questions = state.get("questions") or []
+        if qi >= len(questions):
+            return
+        q = questions[qi]
+        msg_id = cb.get("message", {}).get("message_id")
+
+        # —— 老爸点了"自定义文本回复" ——
+        if oi_s == "other":
+            telegram_api("editMessageReplyMarkup", {
+                "chat_id": chat_id,
+                "message_id": msg_id,
+                "reply_markup": {"inline_keyboard": []},
+            }, token=self.bot_token)
+            self.reply(chat_id, "✏️ 请直接打字回复（任何文字都会发给太子）")
+            try:
+                os.remove(state_file)
+            except Exception:
+                pass
+            return
+
+        # —— 老爸选了某个选项 ——
+        try:
+            oi = int(oi_s)
+            opt = q["options"][oi]
+        except Exception:
+            return
+
+        label = opt.get("label", "")
+        desc = opt.get("description", "")
+        answer_text = f"{label}（{desc}）" if desc else label
+        state.setdefault("answers", []).append({
+            "question": q.get("question", ""),
+            "label": label,
+            "description": desc,
+        })
+        state["cursor"] = qi + 1
+
+        # 编辑原消息：去按钮 + 标注已选（纯文本，避免 Markdown 400）
+        try:
+            done_text = f"✅ 已选：{label}"
+            telegram_api("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": msg_id,
+                "text": (cb.get("message", {}).get("text", "") or q.get("question", "")) + f"\n\n{done_text}",
+            }, token=self.bot_token)
+        except Exception:
+            pass
+
+        # —— 还有下一题：推新按钮组 ——
+        if state["cursor"] < len(questions):
+            with open(state_file, "w") as f:
+                json.dump(state, f, ensure_ascii=False)
+            self._send_auq_next(chat_id, state)
+            return
+
+        # —— 全部答完：拼答案 paste 到 tmux ——
+        if len(state["answers"]) == 1:
+            payload = f"[Telegram 按钮回复] {state['answers'][0]['label']}"
+        else:
+            lines = ["[Telegram 按钮回复]"]
+            for i, a in enumerate(state["answers"], 1):
+                lines.append(f"Q{i}: {a['label']}")
+            payload = "\n".join(lines)
+
+        sess = state.get("tmux_session") or self.profile.get("tmux_session", TMUX_SESSION)
+        if not tmux_exists(sess):
+            self.reply(chat_id, f"⚠️ tmux session '{sess}' 不存在，答案没塞进去")
+        else:
+            # 关键：和 handle_message 一致，paste 前写 pending_file + 拉起 typing loop
+            # 否则 Stop hook 看到 no pending file 会 skip，太子的回复推不到 Telegram
+            pending_file = self.profile.get("pending_file", PENDING_FILE)
+            chat_id_file = self.profile.get("chat_id_file", CHAT_ID_FILE)
+            try:
+                with open(chat_id_file, "w") as f:
+                    f.write(str(chat_id))
+            except Exception:
+                pass
+            try:
+                with open(pending_file, "w") as f:
+                    f.write(str(int(time.time())))
+            except Exception:
+                pass
+            threading.Thread(
+                target=send_typing_loop,
+                args=(chat_id, self.bot_token, pending_file),
+                daemon=True
+            ).start()
+            tmux_send_with_enter(payload, session=sess)
+            self.reply(chat_id, "✅ 已转给太子")
+
+        try:
+            os.remove(state_file)
+        except Exception:
+            pass
+
+    def _send_auq_next(self, chat_id, state):
+        """推下一题的按钮组（纯文本）。"""
+        questions = state["questions"]
+        qi = state["cursor"]
+        q = questions[qi]
+        nonce = state["nonce"]
+        lines = [f"🤔 太子在问老爸 (第 {qi+1}/{len(questions)} 题)", ""]
+        lines.append(q["question"])
+        lines.append("")
+        for i, o in enumerate(q["options"]):
+            if o.get("description"):
+                lines.append(f"  {i+1}. {o['label']} — {o['description']}")
+            else:
+                lines.append(f"  {i+1}. {o['label']}")
+        text = "\n".join(lines)
+
+        kb_rows = []
+        for i, o in enumerate(q["options"]):
+            kb_rows.append([{
+                "text": f"{i+1}. {o['label']}"[:60],
+                "callback_data": f"auq:{nonce}:{qi}:{i}",
+            }])
+        kb_rows.append([{
+            "text": "✏️ 自定义文本回复",
+            "callback_data": f"auq:{nonce}:{qi}:other",
+        }])
+
+        resp = telegram_api("sendMessage", {
+            "chat_id": int(chat_id),
+            "text": text,
+            "reply_markup": {"inline_keyboard": kb_rows},
+        }, token=self.bot_token)
+        if resp and resp.get("ok"):
+            state_file = os.path.expanduser(f"~/.claude/ask_pending/{nonce}.json")
+            state["message_id"] = resp["result"]["message_id"]
+            with open(state_file, "w") as f:
+                json.dump(state, f, ensure_ascii=False)
 
     def download_file(self, file_id, filename):
         """Download a file from Telegram by file_id, return local file path or None."""
@@ -752,7 +1007,7 @@ class Handler(BaseHTTPRequestHandler):
             cmd = text.split()[0].lower()
 
             if cmd == "/status":
-                cur_model = get_model(self.profile.get("model_file")) or "claude-opus-4-8"
+                cur_model = get_model(self.profile.get("model_file")) or "claude-fable-5"
                 cur_label = next((l for m, l, *_ in MODELS if m == cur_model), cur_model)
                 cur_provider = get_provider(cur_model)
                 sess = self.profile.get("tmux_session", TMUX_SESSION)
@@ -884,7 +1139,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if cmd == "/model":
-                current = get_model(self.profile.get("model_file")) or "claude-opus-4-8"
+                current = get_model(self.profile.get("model_file")) or "claude-fable-5"
                 kb = [[{"text": f"{'✓ ' if current == m else ''}{label}", "callback_data": f"model:{m}"}] for m, label, *_ in MODELS]
                 telegram_api("sendMessage", {
                     "chat_id": chat_id,
@@ -926,7 +1181,7 @@ class Handler(BaseHTTPRequestHandler):
         tmux_sess    = self.profile.get("tmux_session", TMUX_SESSION)
         pending_file = self.profile.get("pending_file", PENDING_FILE)
         chat_id_file = self.profile.get("chat_id_file", CHAT_ID_FILE)
-        model        = get_model(self.profile.get("model_file")) or "claude-opus-4-8"
+        model        = get_model(self.profile.get("model_file")) or "claude-fable-5"
         provider     = get_provider(model)
 
         # Write chat_id for this bot's hook to pick up
@@ -1489,7 +1744,7 @@ class Handler(BaseHTTPRequestHandler):
                 new_args += ["-c", work_dir]
             subprocess.run(new_args, capture_output=True)
             time.sleep(0.5)
-        model = get_model(model_file) or "claude-opus-4-8"
+        model = get_model(model_file) or "claude-fable-5"
         tmux_send_with_enter(
             claude_launch_cmd(model, extra_args=f" --resume {session_id}", thinking=get_thinking(thinking_file)),
             session=sess,
@@ -1500,7 +1755,7 @@ class Handler(BaseHTTPRequestHandler):
         p = profile if profile is not None else self.profile
         t = token   if token   is not None else self.bot_token
         time.sleep(0.3)
-        cur_model = get_model(p.get("model_file")) or "claude-opus-4-8"
+        cur_model = get_model(p.get("model_file")) or "claude-fable-5"
         self._relaunch_for_profile(chat_id, cur_model, profile=p, token=t)
         time.sleep(2)
         telegram_api("sendMessage", {"chat_id": chat_id, "text": f"[{p['name']}] Claude Code relaunched ✓"}, token=t)
@@ -1683,6 +1938,10 @@ def main():
 
     print(f"Bridge on :{PORT} | tmux: {TMUX_SESSION}")
     print(f"Active bots: {[p['name'] for p in BOT_PROFILES.values() if p.get('token')]}")
+
+    # 回复轮询线程：不依赖 Stop 钩子，回合结束后主动发回复
+    threading.Thread(target=reply_poller, daemon=True).start()
+    print("[poller] reply poller started (Stop-hook independent)")
     try:
         # ThreadingHTTPServer so dashboard SSE streams don't block webhooks.
         ThreadingHTTPServer.allow_reuse_address = True
