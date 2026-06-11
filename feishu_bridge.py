@@ -69,20 +69,47 @@ def get_model() -> str:
     return DEFAULT_MODEL
 
 
+THINKING_FILE = os.path.expanduser("~/.claude/telegram_thinking_feishu")
+THINK_BUDGET  = {"medium": 8000, "high": 16000, "xhigh": 24000, "max": 31999}
+
+
+def claude_launch_cmd() -> str:
+    model = get_model()
+    cmd = f"claude --dangerously-skip-permissions --model {model}"
+    try:
+        level = open(THINKING_FILE).read().strip()
+    except Exception:
+        level = ""
+    if level in THINK_BUDGET and "haiku" not in model:
+        cmd = f"MAX_THINKING_TOKENS={THINK_BUDGET[level]} " + cmd
+    return cmd
+
+
+def claude_alive() -> bool:
+    """session 里前台进程是不是 claude（claude 退出后 pane 是裸 bash，
+    消息会被注入 shell 报 command not found，必须重新拉起）。"""
+    r = subprocess.run(["tmux", "display-message", "-p", "-t", TMUX_SESSION,
+                        "#{pane_current_command}"], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() not in ("bash", "zsh", "sh", "dash")
+
+
 def ensure_session() -> bool:
-    """session 不存在时自动创建并启动 Claude（与 bridge.py 行为对齐）。
+    """session 不存在或 Claude 已退出时自动拉起（与 bridge.py 行为对齐）。
     返回 True 表示是新拉起的（调用方需延迟注入消息等 Claude 就绪）。"""
     if tmux_exists():
-        return False
+        if claude_alive():
+            return False
+        # session 在但 Claude 死了：在原 session 里重新启动 Claude
+        subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-c"])
+        time.sleep(0.3)
+        tmux_send_with_enter(claude_launch_cmd())
+        lark.logger.info(f"检测到 Claude 已退出，重新拉起 (model={get_model()})")
+        return True
     os.makedirs(WORK_DIR, exist_ok=True)
     subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-c", WORK_DIR],
                    capture_output=True)
     time.sleep(0.3)
-    cmd = f"claude --dangerously-skip-permissions --model {get_model()}"
-    subprocess.run(["tmux", "load-buffer", "-"], input=cmd.encode())
-    subprocess.run(["tmux", "paste-buffer", "-t", TMUX_SESSION])
-    time.sleep(0.3)
-    subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"])
+    tmux_send_with_enter(claude_launch_cmd())
     lark.logger.info(f"自动拉起 tmux session {TMUX_SESSION} (model={get_model()})")
     return True
 
