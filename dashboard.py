@@ -101,6 +101,7 @@ MEM_FILES         = ["MEMORY.md", "PROJECTS.md", "PENDING.md", "RECENT.md"]
 PROACTIVE_BOT_DEFAULT = {
     "interval_min": 30, "quiet_start": 23, "quiet_end": 8,
     "min_gap_hours": 4, "max_per_day": 4, "min_idle_hours": 2,
+    "max_silence_hours": 24,
     "brain_model": "claude-haiku-4-5-20251001",
     "optimize_enabled": True, "optimize_model": "",
 }
@@ -238,7 +239,8 @@ def save_proactive_config(bot, data):
     if "enabled" in data:
         cur["enabled"] = bool(data["enabled"])
     for k in ("interval_min", "quiet_start", "quiet_end",
-              "min_gap_hours", "max_per_day", "min_idle_hours"):
+              "min_gap_hours", "max_per_day", "min_idle_hours",
+              "max_silence_hours"):
         if k in data:
             try:
                 cur[k] = int(data[k])
@@ -876,6 +878,16 @@ def get_status(bot_key="main"):
         except Exception:
             pass
 
+    # Claude 是否正在处理消息（pending 文件存在且未过期）→ 前端渲染思考动效
+    busy = False
+    pf = profile.get("pending_file")
+    if pf and os.path.exists(pf):
+        try:
+            pt = float(open(pf).read().strip() or 0)
+            busy = (time.time() - pt) < 600
+        except Exception:
+            busy = True
+
     return {
         "bot":     bot_key,
         "name":    profile["name"],
@@ -884,6 +896,7 @@ def get_status(bot_key="main"):
         "uptime":  uptime,
         "model":   model,
         "thinking": thinking,
+        "busy":    busy,
         "tokens":  tokens,
         "webhook": webhook,
         "chat_id": chat_id,
@@ -1136,7 +1149,10 @@ body::after{
 #log-output .ll.cl-text{color:#e8eef6;font-weight:500;white-space:pre-wrap;margin:7px 0;line-height:1.65}
 #log-output .ll.cl-text .cl-dot{color:#34d399;margin-right:4px}
 #log-output .ll.cl-tool{color:#56a8d6;margin-top:5px}
-#log-output .ll.cl-result{color:#44617f;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-left:14px}
+#log-output .ll.cl-tool .cl-tool-name{font-weight:600}
+#log-output .ll.cl-tool .cl-tool-arg{opacity:.65}
+#log-output .ll.cl-result{color:#44617f;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-left:14px;cursor:pointer}
+#log-output .ll.cl-result.open{white-space:pre-wrap;overflow:visible;text-overflow:clip}
 #log-output .ll.cl-think{margin:7px 0}
 #log-output .ll.cl-think summary{cursor:pointer;color:#9d8cff;font-style:italic;list-style:none;user-select:none}
 #log-output .ll.cl-think summary::-webkit-details-marker{display:none}
@@ -1146,6 +1162,31 @@ body::after{
   color:#857fa6;font-style:italic;white-space:pre-wrap;
   border-left:2px solid #3a3560;padding:2px 0 2px 9px;margin:4px 0 4px 3px;line-height:1.6;
 }
+#log-output .ll.cl-think .cl-think-prev{
+  color:#6b6390;font-style:italic;font-size:10px;margin-left:6px;
+}
+
+/* ── 思考动效：Claude 处理中时日志底部的实时指示器（仿桌面端 shimmer）── */
+#cl-live{
+  display:none;align-items:center;gap:8px;
+  padding:8px 2px 2px;margin-top:6px;border-top:1px dashed var(--border);
+  font-size:12px;
+}
+#cl-live.on{display:flex}
+#cl-live .cl-spin{
+  color:#c084fc;display:inline-block;width:15px;text-align:center;
+  animation:clSpinPulse 1.1s ease-in-out infinite;
+}
+#cl-live .cl-live-txt{
+  font-style:italic;
+  background:linear-gradient(90deg,#767b96 30%,#f0f4ff 50%,#767b96 70%);
+  background-size:200% 100%;
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  animation:clShimmer 1.8s linear infinite;
+}
+#cl-live .cl-live-sec{color:var(--text3);font-size:10px}
+@keyframes clShimmer{0%{background-position:150% 0}100%{background-position:-50% 0}}
+@keyframes clSpinPulse{0%,100%{transform:scale(1);opacity:.8}50%{transform:scale(1.3);opacity:1}}
 
 /* ── Fullscreen log ── */
 .log-panel.fullscreen{
@@ -1418,6 +1459,7 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
     </div>
   </div>
   <div id="log-output"></div>
+  <div id="cl-live"><span class="cl-spin">✶</span><span class="cl-live-txt" id="clLiveTxt">思考中…</span><span class="cl-live-sec" id="clLiveSec"></span></div>
 </div>
 
 <!-- API Keys -->
@@ -1455,6 +1497,7 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
     <div class="kr"><label>最小间隔</label><span><input id="p-gap" type="number" min="0" style="width:70px"> 小时</span></div>
     <div class="kr"><label>每天上限</label><span><input id="p-max" type="number" min="0" style="width:70px"> 条</span></div>
     <div class="kr"><label>刚聊完静默</label><span><input id="p-idle" type="number" min="0" style="width:70px"> 小时内不插话</span></div>
+    <div class="kr"><label>保底主动</label><span><input id="p-silence" type="number" min="0" style="width:70px"> 小时没联系必主动（0=关闭）</span></div>
     <div class="kr"><label>大脑模型</label>
       <select id="p-model" style="flex:1;padding:6px;border-radius:8px">
         <option value="claude-haiku-4-5-20251001">Haiku 4.5（快·省额度）</option>
@@ -1542,13 +1585,11 @@ function switchBot(bot){
   document.querySelectorAll(".bot-tab").forEach(el=>{
     el.classList.toggle("active",el.dataset.bot===bot);
   });
-  // 清空当前日志，按当前可用模式重连拉新 Bot 的内容（不强切 SSE，避免反复失败弹窗）
+  // 清空当前日志，快照先行立即显示新 Bot 内容，实时流静默接上（永不弹窗）
   document.getElementById("log-output").innerHTML="";
-  _pollSeq=0;_sseSeq=0;
-  if(_sse){try{_sse.close();}catch(e){}_sse=null;}
-  stopPolling();
+  _liveEvtTs=0;setClaudeLive(false);   // 动效随旧 Bot 清掉，新 Bot 状态由 fetchStatus 决定
+  connectLogs();
   fetchStatus();
-  if(_usePolling){startPolling(true);probeSSE();}else{startSSE();}
   loadMemory();
   loadProactive();
   toast("已切换到 "+(BOT_NAMES[bot]||bot));
@@ -1682,6 +1723,7 @@ function updateUI(s){
     document.getElementById("cUp").textContent="—";
   }
   if(typeof s.thinking==="string")curThink=s.thinking;
+  setClaudeLive(!!s.busy);   // pending 中 → 日志底部思考动效
   if(s.model&&s.model!==curModel){
     curModel=s.model;
   }
@@ -1761,6 +1803,7 @@ async function loadProactive(){
     document.getElementById("p-gap").value=c.min_gap_hours;
     document.getElementById("p-max").value=c.max_per_day;
     document.getElementById("p-idle").value=c.min_idle_hours;
+    document.getElementById("p-silence").value=(c.max_silence_hours!=null?c.max_silence_hours:24);
     if(c.brain_model)document.getElementById("p-model").value=c.brain_model;
     const run=d.running;
     const badge=document.getElementById("proState");
@@ -1769,7 +1812,8 @@ async function loadProactive(){
     const st=d.state||{};
     let info=["当前编辑："+(BOT_NAMES[curBot]||curBot)+"（每个 Bot 独立配置）"];
     if(st.sent_today!=null)info.push("今日已主动 "+st.sent_today+" 次");
-    if(st.last_sent_ts)info.push("上次 "+new Date(st.last_sent_ts*1000).toLocaleString());
+    if(st.last_decision)info.push("上次判断"+(st.last_decision_ts?" "+new Date(st.last_decision_ts*1000).toLocaleTimeString("zh-CN",{hour:"2-digit",minute:"2-digit"}):"")+" → "+st.last_decision);
+    if(st.last_sent_ts)info.push("上次发送 "+new Date(st.last_sent_ts*1000).toLocaleString());
     if(st.last_proactive)info.push("内容：“"+st.last_proactive+"”");
     document.getElementById("proInfo").textContent=info.join("  ·  ");
   }catch(e){}
@@ -1784,6 +1828,7 @@ async function saveProactive(){
     min_gap_hours:+document.getElementById("p-gap").value,
     max_per_day:+document.getElementById("p-max").value,
     min_idle_hours:+document.getElementById("p-idle").value,
+    max_silence_hours:+document.getElementById("p-silence").value,
     brain_model:document.getElementById("p-model").value,
   };
   try{
@@ -1830,26 +1875,76 @@ let _usePolling=(localStorage.getItem("logTransport")==="poll");   // 记住上�
 
 function _esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 // Claude transcript 结构化事件（@@CLAUDE@@ 前缀 + JSON）→ 仿桌面端分块渲染
+// 事件时间戳(HH:MM:SS)距现在 ≤15s 才算实时事件：SSE/轮询回放的历史行不会误触发动效
+function _evtFresh(ts){
+  if(!ts)return false;
+  const m=String(ts).split(":");
+  if(m.length!==3)return false;
+  const now=new Date();
+  const evtSec=(+m[0])*3600+(+m[1])*60+(+m[2]);
+  const nowSec=now.getHours()*3600+now.getMinutes()*60+now.getSeconds();
+  let d=Math.abs(nowSec-evtSec);
+  if(d>43200)d=86400-d;   // 跨午夜
+  return d<=15;
+}
 function _renderClaudeEvt(jsonStr,first){
   let e;try{e=JSON.parse(jsonStr);}catch(err){return null;}
+  if(_evtFresh(e.ts))_liveOnEvt(e.k);   // 实时事件 = Claude 正在干活，点亮思考动效
   const d=document.createElement("div");
   const base="ll"+(first?"":" new");
   if(e.k==="think"){
     d.className=base+" cl-think";
-    d.innerHTML='<details><summary>✻ 思考过程 <span class="cl-ts">'+_esc(e.ts||"")+' · '+(e.t||"").length+'字</span></summary><div class="cl-think-body">'+_esc(e.t)+'</div></details>';
+    const prev=_esc(((e.t||"").split("\n")[0]||"").slice(0,40));
+    d.innerHTML='<details><summary>✻ 思考过程 <span class="cl-ts">'+_esc(e.ts||"")+' · '+(e.t||"").length+'字</span><span class="cl-think-prev">'+prev+'…</span></summary><div class="cl-think-body">'+_esc(e.t)+'</div></details>';
   }else if(e.k==="text"){
     d.className=base+" cl-text";
     d.innerHTML='<span class="cl-dot">●</span>'+_esc(e.t);
   }else if(e.k==="tool"){
     d.className=base+" cl-tool";
-    d.textContent="⏺ "+e.t;
+    const t=e.t||"",i=t.indexOf("(");
+    if(i>0)d.innerHTML='⏺ <span class="cl-tool-name">'+_esc(t.slice(0,i))+'</span><span class="cl-tool-arg">'+_esc(t.slice(i))+'</span>';
+    else d.textContent="⏺ "+t;
   }else if(e.k==="result"){
     d.className=base+" cl-result";
     d.textContent="⎿ "+e.t;
+    d.title="点击展开/收起";
+    d.onclick=()=>d.classList.toggle("open");
   }else{
     d.className=base;d.textContent=e.t||"";
   }
   return d;
+}
+
+// ── Claude 思考动效：pending 期间在日志底部显示动态指示器（仿桌面端）──
+const _LIVE_GLYPHS=["✶","✸","✹","✺","✻","✽","✻","✺","✹","✸"];
+const _LIVE_WORDS=["思考中","琢磨中","推敲中","酝酿中","梳理中","构思中"];
+let _liveTimer=null,_liveStart=0,_liveTick=0,_liveHint="",_liveEvtTs=0;
+function _liveOnEvt(kind){
+  _liveEvtTs=Date.now();
+  if(kind==="tool")_liveHint="调用工具中";
+  else if(kind==="result")_liveHint="处理结果中";
+  else _liveHint="";              // think/text 走轮换词
+  setClaudeLive(true);
+}
+function setClaudeLive(on){
+  const el=document.getElementById("cl-live");
+  if(!el)return;
+  if(on&&!_liveTimer){
+    _liveStart=Date.now();_liveTick=0;
+    el.classList.add("on");
+    _liveTimer=setInterval(()=>{
+      _liveTick++;
+      el.querySelector(".cl-spin").textContent=_LIVE_GLYPHS[_liveTick%_LIVE_GLYPHS.length];
+      const word=_liveHint||_LIVE_WORDS[Math.floor(_liveTick/27)%_LIVE_WORDS.length]; // ~4s 换一个词
+      document.getElementById("clLiveTxt").textContent=word+"…";
+      document.getElementById("clLiveSec").textContent=Math.floor((Date.now()-_liveStart)/1000)+"s";
+    },150);
+  }else if(!on&&_liveTimer){
+    // 刚有事件流入（5s 内）说明还在干活，等下一轮状态确认再熄灭，避免闪烁
+    if(Date.now()-_liveEvtTs<5000)return;
+    clearInterval(_liveTimer);_liveTimer=null;_liveHint="";
+    el.classList.remove("on");
+  }
 }
 function _appendLog(text,first){
   const logEl=document.getElementById("log-output");
@@ -1883,8 +1978,7 @@ function stopPolling(){
 
 function startPolling(silent){
   stopPolling();
-  // 已在轮询模式（记忆恢复）或静默调用时不弹提示
-  if(!silent&&!_usePolling)toast("SSE不可用，已切换轮询模式");
+  // 降级永远静默：内容照常走轮询，后台 probeSSE 通了会无感切回，无需打扰用户
   _usePolling=true;
   localStorage.setItem("logTransport","poll");
   function poll(){
@@ -2013,23 +2107,31 @@ document.querySelectorAll(".bot-tab").forEach(el=>{
 });
 fetchStatus();loadKeys();loadProactive();loadMemory();
 setInterval(loadProactive,15000);
-// 先拉一次快照，立即显示历史日志（防止 SSE 被云端缓冲时面板空白）
-fetch("/api/logs/snapshot?bot="+curBot+"&since=0")
-  .then(r=>r.json())
-  .then(d=>{
-    if(d.lines)d.lines.forEach(t=>_appendLog(t,true));
-    if(d.seq){_sseSeq=d.seq;_pollSeq=d.seq;}
-  })
-  .catch(()=>{})
-  .finally(()=>{
-    if(_usePolling){
-      // 上次是轮询模式：直接开轮询（零等待、不弹窗），后台静默探测 SSE
-      startPolling(true);
-      probeSSE();
-    }else{
-      startSSE();
-    }
-  });
+// 快照先行 + 按记忆模式接实时流（首次进入与切 Bot 共用）：
+// 快照立即铺满历史日志，SSE 只增量续传（since=seq），即使 SSE 不通内容也已经在了
+function connectLogs(){
+  if(_sse){try{_sse.close();}catch(e){}_sse=null;}
+  if(_sseReconnect){clearTimeout(_sseReconnect);_sseReconnect=null;}
+  stopPolling();
+  _pollSeq=0;_sseSeq=0;
+  const myBot=curBot;   // 快速来回切 Bot 时丢弃在途的旧 Bot 响应
+  fetch("/api/logs/snapshot?bot="+curBot+"&since=0")
+    .then(r=>r.json())
+    .then(d=>{
+      if(myBot!==curBot)return;
+      if(d.lines)d.lines.forEach(t=>_appendLog(t,true));
+      if(d.seq){_sseSeq=d.seq;_pollSeq=d.seq;}
+    })
+    .catch(()=>{})
+    .finally(()=>{
+      if(myBot!==curBot)return;
+      if(_usePolling){startPolling(true);probeSSE();}
+      else startSSE();
+    });
+}
+connectLogs();
+// 轮询模式下每 30s 静默探测一次 SSE，通了自动无感切回（中途掉线也能自愈）
+setInterval(()=>{if(_usePolling)probeSSE();},30000);
 setInterval(fetchStatus,3000);
 </script>
 </body>
@@ -2246,8 +2348,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         try:
             while True:
+                # 5s 心跳：浏览器切走后，写 ping 失败即释放本线程和 bridge 侧代理连接
+                # （15s 时旧连接挂太久，来回切 Bot 容易堆积把隧道/连接数占满）
                 try:
-                    line = q.get(timeout=15)
+                    line = q.get(timeout=5)
                     self.wfile.write(f"data: {line}\n\n".encode())
                     self.wfile.flush()
                 except queue.Empty:
