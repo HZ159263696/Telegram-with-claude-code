@@ -7,3 +7,5 @@ build/
 dist/
 *.exe
 *.pkg
+.playwright-mcp/
+uv.lock

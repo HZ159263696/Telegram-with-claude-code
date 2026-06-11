@@ -23,9 +23,13 @@ APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 MAX_REPLY_LEN = 28000
 
 TMUX_SESSION        = "claude_feishu"
+WORK_DIR            = "/mnt/d/AI/feishu_workspace"
+MODEL_FILE          = os.path.expanduser("~/.claude/telegram_model_feishu")
+DEFAULT_MODEL       = "claude-sonnet-4-6"
 PENDING_FILE        = os.path.expanduser("~/.claude/telegram_pending_feishu")
 FEISHU_CHAT_ID_FILE = os.path.expanduser("~/.claude/feishu_chat_id")
 FEISHU_MSG_ID_FILE  = os.path.expanduser("~/.claude/feishu_reply_message_id")
+PENDING_TIMEOUT     = 600   # 与 bridge.py 一致：pending 超过 600s 视为过期
 
 client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
 _start_time = time.time()
@@ -55,27 +59,93 @@ def tmux_interrupt():
     subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "C-c"])
 
 
+def get_model() -> str:
+    try:
+        m = open(MODEL_FILE).read().strip()
+        if m:
+            return m
+    except Exception:
+        pass
+    return DEFAULT_MODEL
+
+
+def ensure_session() -> bool:
+    """session 不存在时自动创建并启动 Claude（与 bridge.py 行为对齐）。
+    返回 True 表示是新拉起的（调用方需延迟注入消息等 Claude 就绪）。"""
+    if tmux_exists():
+        return False
+    os.makedirs(WORK_DIR, exist_ok=True)
+    subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-c", WORK_DIR],
+                   capture_output=True)
+    time.sleep(0.3)
+    cmd = f"claude --dangerously-skip-permissions --model {get_model()}"
+    subprocess.run(["tmux", "load-buffer", "-"], input=cmd.encode())
+    subprocess.run(["tmux", "paste-buffer", "-t", TMUX_SESSION])
+    time.sleep(0.3)
+    subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"])
+    lark.logger.info(f"自动拉起 tmux session {TMUX_SESSION} (model={get_model()})")
+    return True
+
+
 # ── 飞书消息工具 ───────────────────────────────────────────────────────────────
 
-def extract_content(message) -> tuple[str, str]:
-    """从飞书消息体提取文本和图片 key，返回 (text, image_key)。"""
-    if message.message_type == "text":
+def extract_content(message) -> tuple[str, list[str]]:
+    """从飞书消息体提取文本和图片 key，返回 (text, image_keys)。
+
+    支持三种消息类型：
+    - text：纯文本
+    - image：单张图片
+    - post：富文本（群里 @机器人 同时发图即为此类型），可含多张图
+    """
+    mtype = message.message_type
+
+    if mtype == "text":
         try:
             content = json.loads(message.content)
             text = content.get("text", "")
         except Exception:
-            return "", ""
+            return "", []
         if message.mentions:
             for m in message.mentions:
                 text = text.replace(m.key, "")
-        return text.strip(), ""
-    if message.message_type == "image":
+        return text.strip(), []
+
+    if mtype == "image":
         try:
             content = json.loads(message.content)
-            return "", content.get("image_key", "")
+            key = content.get("image_key", "")
+            return "", [key] if key else []
         except Exception:
-            return "", ""
-    return "", ""
+            return "", []
+
+    if mtype == "post":
+        # 富文本 content 形如 {"title": "..", "content": [[{tag,...}, ..], ..]}
+        try:
+            content = json.loads(message.content)
+        except Exception:
+            return "", []
+        texts: list[str] = []
+        image_keys: list[str] = []
+        if content.get("title"):
+            texts.append(content["title"])
+        for paragraph in content.get("content", []):
+            for el in paragraph:
+                tag = el.get("tag")
+                if tag == "text":
+                    texts.append(el.get("text", ""))
+                elif tag == "a":
+                    texts.append(el.get("href", "") or el.get("text", ""))
+                elif tag == "img":
+                    k = el.get("image_key", "")
+                    if k:
+                        image_keys.append(k)
+        text = " ".join(t for t in texts if t).strip()
+        if message.mentions:
+            for m in message.mentions:
+                text = text.replace(m.key, "")
+        return text.strip(), image_keys
+
+    return "", []
 
 
 def download_feishu_image(message_id: str, image_key: str) -> str:
@@ -90,9 +160,15 @@ def download_feishu_image(message_id: str, image_key: str) -> str:
         if not resp.success():
             lark.logger.error(f"图片下载失败 code={resp.code} msg={resp.msg}")
             return ""
-        local_path = f"/tmp/feishu_image_{int(time.time())}.jpg"
+        # lark_oapi 二进制下载：文件内容在 resp.file（旧版本可能在 resp.data.file）
+        raw = getattr(resp, "file", None)
+        if raw is None and getattr(resp, "data", None) is not None:
+            raw = getattr(resp.data, "file", None)
+        if raw is None:
+            lark.logger.error("图片下载：响应里找不到文件内容")
+            return ""
+        local_path = f"/tmp/feishu_image_{int(time.time()*1000)}.jpg"
         with open(local_path, "wb") as f:
-            raw = resp.data.file
             f.write(raw.read() if hasattr(raw, "read") else raw)
         return local_path
     except Exception as e:
@@ -184,29 +260,50 @@ def handle_message(data: P2ImMessageReceiveV1) -> None:
     """提取文本/图片 → 写 pending 文件 → 注入 tmux；Stop 钩子负责回复。"""
     msg = data.event.message
     chat_id = getattr(msg, "chat_id", "") or ""
-    text, image_key = extract_content(msg)
+    text, image_keys = extract_content(msg)
+    lark.logger.info(f"消息类型={msg.message_type} 文本={text[:60]!r} 图片数={len(image_keys)}")
 
-    if not text and not image_key:
+    if not text and not image_keys:
         send_reply(msg.message_id, "（暂只支持文本和图片消息哦）")
         return
 
-    # 图片：下载到本地，把路径拼入 prompt
-    if image_key:
-        image_path = download_feishu_image(msg.message_id, image_key)
-        if not image_path:
-            send_reply(msg.message_id, "图片下载失败，请重试")
+    # 图片：逐张下载到本地，把路径拼入 prompt
+    if image_keys:
+        paths = []
+        for key in image_keys:
+            p = download_feishu_image(msg.message_id, key)
+            if p:
+                paths.append(p)
+        if not paths:
+            send_reply(msg.message_id, "图片下载失败，请确认飞书后台已开通「获取与上传图片或文件资源」(im:resource) 权限")
             return
-        text = f"请用 Read 工具查看图片 {image_path}\n\n用户问题：{text or '请描述这张图片的内容'}"
+        user_q = text or "请描述这些图片的内容"
+        path_lines = "\n".join(f"- {p}" for p in paths)
+        text = f"请用 Read 工具查看以下图片，然后回答：\n{path_lines}\n\n用户问题：{user_q}"
 
-    lark.logger.info(f"收到消息: {text[:80]}")
+    lark.logger.info(f"注入 Claude: {text[:80]}")
 
     if text.startswith("/"):
         if handle_command(chat_id, msg.message_id, text):
             return
 
-    if not tmux_exists():
-        send_reply(msg.message_id, "❌ Claude 未启动（tmux session claude_feishu 不存在）")
-        return
+    # 忙碌保护（与 bridge.py 一致）：上一轮还没回完就来新消息，
+    # 直接覆盖 pending/message_id 会让两轮回复互相错乱，先挡掉
+    if os.path.exists(PENDING_FILE):
+        try:
+            pt = int(open(PENDING_FILE).read().strip())
+            if time.time() - pt < PENDING_TIMEOUT:
+                send_reply(msg.message_id, "⏳ Claude 还在处理上一条消息，请稍候再发（要中断用 /stop）")
+                return
+        except Exception:
+            pass
+        try:
+            os.remove(PENDING_FILE)   # 过期/损坏的 pending 直接清掉
+        except FileNotFoundError:
+            pass
+
+    # session 不存在则自动拉起（之前只会报错，挂了得重跑 start.sh）
+    just_started = ensure_session()
 
     # 写 pending 文件（Stop 钩子据此决定回复哪个 bot）
     with open(PENDING_FILE, "w") as f:
@@ -216,6 +313,9 @@ def handle_message(data: P2ImMessageReceiveV1) -> None:
     with open(FEISHU_MSG_ID_FILE, "w") as f:
         f.write(msg.message_id)
 
+    if just_started:
+        send_reply(msg.message_id, "🚀 Claude 正在启动，消息将在 5 秒后自动发送...")
+        time.sleep(5)   # 本函数已在独立线程中，阻塞不影响其它消息
     tmux_send_with_enter(text)
 
 

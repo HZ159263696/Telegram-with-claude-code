@@ -42,7 +42,10 @@ except Exception:
 LOG          = "/tmp/proactive.log"
 CONFIG_FILE  = os.path.expanduser("~/.claude/proactive_config.json")
 STATE_FILE   = os.path.expanduser("~/.claude/proactive_state.json")
-WORKDIR      = "/mnt/d/AI/claudecode-telegram-main"
+# 大脑的 headless claude -p 在独立 cwd 跑：避免它的 transcript 写进各 bot 交互 session
+# 的 projects 目录，从而污染 bridge 轮询找的"最新 transcript"。
+BRAIN_WORKDIR = os.path.expanduser("~/.claude/proactive_workdir")
+os.makedirs(BRAIN_WORKDIR, exist_ok=True)
 
 FEISHU_APP_ID     = os.environ.get("FEISHU_APP_ID",     "REDACTED_FEISHU_APP_ID")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
@@ -310,7 +313,7 @@ def ask_brain(bcfg, prompt, model=None, timeout=150):
            "--dangerously-skip-permissions"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, env=env, cwd=WORKDIR)
+                           timeout=timeout, env=env, cwd=BRAIN_WORKDIR)
     except subprocess.TimeoutExpired:
         log("brain 超时")
         return ""

@@ -55,12 +55,12 @@ if [ -n "$TMUX" ]; then
     echo "[1] Starting tmux session 'claude' (主控Bot)..."
     tmux kill-session -t claude 2>/dev/null || true
 
-    # Read saved model preference (default: claude-opus-4-7)
+    # Read saved model preference (default: claude-fable-5)
     MODEL_FILE="$HOME/.claude/telegram_model"
-    SAVED_MODEL="claude-opus-4-7"
+    SAVED_MODEL="claude-fable-5"
     if [ -f "$MODEL_FILE" ]; then
         SAVED_MODEL=$(cat "$MODEL_FILE" | tr -d '[:space:]')
-        [ -z "$SAVED_MODEL" ] && SAVED_MODEL="claude-opus-4-7"
+        [ -z "$SAVED_MODEL" ] && SAVED_MODEL="claude-fable-5"
     fi
 
     # Claude 模型（claude-* 开头）直连 Anthropic；其它（deepseek/glm/minimax/qwen）走本地代理。
@@ -71,7 +71,7 @@ if [ -n "$TMUX" ]; then
     esac
 
     if $IS_CLAUDE; then
-        tmux new-session -d -s claude "claude --dangerously-skip-permissions --model $SAVED_MODEL"
+        tmux new-session -d -s claude -c "$PROJECT" "claude --dangerously-skip-permissions --model $SAVED_MODEL"
     else
         # Map non-Claude models to CLI aliases for LiteLLM routing
         case "$SAVED_MODEL" in
@@ -84,7 +84,7 @@ if [ -n "$TMUX" ]; then
             qwen-plus)         CLI_MODEL="claude-3-opus-latest" ;;
             *)                 CLI_MODEL="$SAVED_MODEL" ;;
         esac
-        tmux new-session -d -s claude "ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL=http://localhost:4001 claude --dangerously-skip-permissions --model $CLI_MODEL"
+        tmux new-session -d -s claude -c "$PROJECT" "ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL=http://localhost:4001 claude --dangerously-skip-permissions --model $CLI_MODEL"
     fi
     echo "    tmux session 'claude' started (model: $SAVED_MODEL)."
 
@@ -111,6 +111,8 @@ if [ -n "$TMUX" ]; then
         [ -z "$FEISHU_MODEL" ] && FEISHU_MODEL="claude-sonnet-4-6"
     fi
     mkdir -p /mnt/d/AI/feishu_workspace
+    # 部署飞书发文件助手（Claude 在 session 内调用，把文件发回飞书群）
+    cp "$PROJECT/hooks/feishu_send_file.py" "$HOME/.claude/hooks/feishu_send_file.py" 2>/dev/null || true
     tmux new-session -d -s claude_feishu -c /mnt/d/AI/feishu_workspace \
         "claude --dangerously-skip-permissions --model $FEISHU_MODEL"
     echo "    tmux session 'claude_feishu' started in /mnt/d/AI/feishu_workspace (model: $FEISHU_MODEL)"
@@ -140,18 +142,10 @@ if [ -n "$TMUX" ]; then
 
             if [ -n "$URL" ]; then
                 echo "    Public URL: $URL"
-                echo "    Registering Telegram webhook..."
-                # cloudflared trycloudflare 子域名 DNS 需要几秒到几十秒传播，所以失败重试
-                for attempt in 1 2 3 4 5 6 7 8 9 10; do
-                    RESULT=$(curl -s -X POST "https://api.telegram.org/bot${TOKEN}/setWebhook" \
-                        -d "url=$URL" -d "drop_pending_updates=true" 2>/dev/null)
-                    if echo "$RESULT" | grep -q '"ok":true'; then
-                        echo "    Webhook registered OK (attempt $attempt)"
-                        break
-                    fi
-                    echo "    Webhook attempt $attempt failed: $RESULT"
-                    sleep 6
-                done
+                # webhook 注册统一由 bridge.py 负责（带 secret_token 校验）。
+                # 此处禁止再裸 setWebhook：不带 secret 的注册会清掉 Telegram 侧 secret，
+                # 导致 bridge 对所有进站请求回 401，主控Bot 全聋（2026-06-11 事故）。
+                # ngrok 用固定域名，URL 不变，断线重连后也无需重新注册。
             else
                 echo "    WARNING: Could not get tunnel URL, retrying in 5s..."
                 kill $LT_PID 2>/dev/null

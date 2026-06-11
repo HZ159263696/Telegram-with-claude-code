@@ -496,6 +496,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PROXY_PORT
-    print(f"[anthropic_proxy] Listening on port {port}, forwarding to {LITELLM_URL}")
+    print(f"[anthropic_proxy] Listening on port {port}, routing to provider endpoints")
     HTTPServer.allow_reuse_address = True
     HTTPServer(("0.0.0.0", port), ProxyHandler).serve_forever()

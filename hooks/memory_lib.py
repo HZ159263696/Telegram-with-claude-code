@@ -18,18 +18,26 @@ RECENT_MAX_ENTRIES = 20      # disk retention
 RECENT_INJECT_TAIL = 8       # how many recent entries to inject per session
 
 
+# 显式 工作区目录 → Bot 映射（与 bridge.py BOT_PROFILES / send-to-telegram.py 一致）
+WORKDIR_BOT = {
+    "/mnt/d/cao_stock":           "stock",
+    "/mnt/d/AI/feishu_workspace": "feishu",
+}
+
+
 def resolve_bot(cwd="", transcript_path=""):
     """根据工作目录 / transcript 路径判定属于哪个 Bot 的记忆。
-    env AKASHIC_MEM 优先（精确覆盖）。"""
+    env AKASHIC_MEM 优先（精确覆盖）；其余按显式工作区映射，不再关键词模糊匹配。"""
     env = os.environ.get("AKASHIC_MEM")
     if env:
         return env.strip()
-    hay = f"{cwd} {transcript_path}".lower()
-    # cao_stock → 路径转写后可能是 cao-stock，两种都匹配
-    if "cao_stock" in hay or "cao-stock" in hay:
-        return "stock"
-    if "feishu" in hay:
-        return "feishu"
+    for wd, bot in WORKDIR_BOT.items():
+        if cwd and (cwd == wd or cwd.startswith(wd + "/")):
+            return bot
+        # transcript 落在 ~/.claude/projects/<编码后工作区>/ 下（非字母数字转 '-'）
+        enc = re.sub(r'[^a-zA-Z0-9]', '-', wd)
+        if transcript_path and f"/projects/{enc}/" in transcript_path:
+            return bot
     return "main"
 
 
