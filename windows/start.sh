@@ -1,5 +1,12 @@
 #!/bin/bash
 # Run inside WSL: starts tmux+Claude and bridge server
+#
+# ⚠️ 后台进程启动约定（务必遵守）：每个 `&` 后台服务都必须写成
+#       nohup CMD > /tmp/xxx.log 2>&1 </dev/null &
+#       disown
+#    三件套缺一不可：</dev/null 断开 stdin、>log 2>&1 断开输出、disown 移出作业表。
+#    否则子进程会继承并占住父 shell 的管道 fd，导致依赖它的持久 shell（如 Claude Code
+#    的 Bash 工具）read 永不返回而"零返回/卡死"。新增后台服务请照此模板。
 
 source /etc/claude_env.sh 2>/dev/null
 source ~/.profile 2>/dev/null
@@ -30,7 +37,8 @@ if [ -n "$TMUX" ]; then
     pkill -f "litellm" 2>/dev/null; sleep 0.5
     LITELLM_CONFIG="$PROJECT/litellm_config.yaml"
     if command -v litellm &>/dev/null; then
-        nohup litellm --config "$LITELLM_CONFIG" --port 4000 > /tmp/litellm.log 2>&1 &
+        nohup litellm --config "$LITELLM_CONFIG" --port 4000 > /tmp/litellm.log 2>&1 </dev/null &
+        disown
         sleep 2
         echo "    LiteLLM proxy started (log: /tmp/litellm.log)"
     else
@@ -43,7 +51,8 @@ if [ -n "$TMUX" ]; then
     fuser -k 4001/tcp 2>/dev/null; sleep 0.3
     PROXY_SCRIPT="$PROJECT/anthropic_proxy.py"
     if [ -f "$PROXY_SCRIPT" ]; then
-        nohup python3 "$PROXY_SCRIPT" > /tmp/anthropic_proxy.log 2>&1 &
+        nohup python3 "$PROXY_SCRIPT" > /tmp/anthropic_proxy.log 2>&1 </dev/null &
+        disown
         sleep 1
         echo "    Anthropic proxy started (log: /tmp/anthropic_proxy.log)"
     else
@@ -156,15 +165,17 @@ if [ -n "$TMUX" ]; then
             echo "    Bridge tunnel crashed, reconnecting in 5s..."
             sleep 5
         done
-    ) &
+    ) > /tmp/tunnel_mgr.log 2>&1 </dev/null &
     BRIDGE_TUNNEL_PID=$!
-    echo "    Bridge tunnel manager started (pid: $BRIDGE_TUNNEL_PID)"
+    disown
+    echo "    Bridge tunnel manager started (pid: $BRIDGE_TUNNEL_PID, log: /tmp/tunnel_mgr.log)"
 
     # 3. Start dashboard (web UI on port 8888)
     echo "[4] Starting dashboard on port 8888..."
     pkill -f "dashboard.py" 2>/dev/null; sleep 0.3
     fuser -k 8888/tcp 2>/dev/null; sleep 0.3
-    nohup env TELEGRAM_BOT_TOKEN="$TOKEN" STOCK_BOT_TOKEN="$STOCK_TOKEN" DASHBOARD_PORT=8888 python3 "$PROJECT/dashboard.py" > /tmp/dashboard.log 2>&1 &
+    nohup env TELEGRAM_BOT_TOKEN="$TOKEN" STOCK_BOT_TOKEN="$STOCK_TOKEN" DASHBOARD_PORT=8888 python3 "$PROJECT/dashboard.py" > /tmp/dashboard.log 2>&1 </dev/null &
+    disown
     echo "    Dashboard started (log: /tmp/dashboard.log)"
 
     # Dashboard 公网入口现在由 bridge.py 反向代理（同一个 ngrok 固定域名）
@@ -176,20 +187,24 @@ if [ -n "$TMUX" ]; then
     # 5. Start Feishu bridge (long-connection WebSocket)
     echo "[6] Starting Feishu bridge..."
     pkill -f "feishu_bridge.py" 2>/dev/null; sleep 0.3
-    nohup python3 "$PROJECT/feishu_bridge.py" > /tmp/feishu_bridge.log 2>&1 &
+    nohup python3 "$PROJECT/feishu_bridge.py" > /tmp/feishu_bridge.log 2>&1 </dev/null &
+    disown
     echo "    Feishu bridge started (log: /tmp/feishu_bridge.log)"
 
     # 5.5 Start Proactive Brain (主动大脑：定时用 claude -p 订阅判断是否主动找用户)
     echo "[6.5] Starting Proactive Brain..."
     pkill -f "proactive.py" 2>/dev/null; sleep 0.3
-    nohup python3 "$PROJECT/proactive.py" > /tmp/proactive.out 2>&1 &
+    nohup python3 "$PROJECT/proactive.py" > /tmp/proactive.out 2>&1 </dev/null &
+    disown
     echo "    Proactive brain started (log: /tmp/proactive.log)"
 
     # 4. Bridge is managed by dashboard (auto-start on dashboard launch)
     echo "[5] Bridge managed by dashboard on port $PORT."
     echo "    Open http://localhost:8888 to control the bridge."
-    # Keep session alive
-    wait
+    # Keep session alive.
+    # 注意：上面所有后台进程都已 disown 移出作业表，`wait` 会立即返回，
+    # 这里用 sleep infinity 让 tmux pane 保持存活（服务已独立运行，与本 pane 解耦）。
+    sleep infinity
 
 else
     # ── NOT in tmux: launch a tmux session and re-run this script inside it ──
