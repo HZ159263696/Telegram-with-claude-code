@@ -85,6 +85,7 @@ DEFAULT_BOT = {
     "min_gap_hours":  4,                 # 两次主动联系的最小间隔（小时）
     "max_per_day":    4,                 # 每天主动上限
     "min_idle_hours": 2,                 # 用户至少安静这么久才考虑主动
+    "max_silence_hours": 24,             # 保底：用户超过这么久没联系必主动一次（0=关闭）
     "brain_model":    "claude-haiku-4-5-20251001",  # 大脑用的模型（快、省额度）
     "optimize_enabled": True,            # 是否每天把零散 RECENT 归并进长期记忆
     "optimize_model":   "",              # 归并用模型（空=用 brain_model；建议 sonnet 更稳）
@@ -291,6 +292,9 @@ def build_prompt(mem_bot, now, idle_str, sent_today, last_proactive, force=False
   · 进行中的项目有自然的跟进点或值得分享的想法；
   · 用户很久没联系了，一句真诚的关心或一个有用的小提醒；
   · 结合当前时间的贴心举动（深夜提醒早点休息、清晨问候并带上今天该做的事）。
+- 把"距离上次对话"的时长当作重要参考：不足半天通常 SKIP；超过 12 小时可以找一个
+  自然的理由主动（跟进项目、待办提醒、简短关心）；超过一整天应当倾向主动，
+  不要让用户觉得你消失了。
 - 绝不重复你最近已经说过的话。
 - 语气自然、简短（一两句即可），像一个真正了解他的朋友，不要客套、不要机械、不要署名。
 - 只基于下面给出的信息判断，**不要使用任何工具**。
@@ -372,10 +376,17 @@ def tick_bot(bcfg, state, name, ignore_limits=False, force=False, respect_interv
         log(f"[{name}] chat_id 为空，跳过")
         return
 
-    # 2. 用户正忙（pending 存在 = 正在等回复）→ 不插话
+    # 2. 用户正忙（pending 未过期 = 正在等回复）→ 不插话。
+    # 只看"存在"会被残留文件永久卡死（hook 没跑到时文件不会消失），必须校验时间戳。
     if os.path.exists(b["pending_file"]):
-        log(f"[{name}] 用户正忙(pending)，跳过")
-        return
+        try:
+            pt = float(open(b["pending_file"]).read().strip() or 0)
+        except Exception:
+            pt = time.time()              # 读不出时间戳，保守视为正忙
+        if time.time() - pt < 600:
+            log(f"[{name}] 用户正忙(pending)，跳过")
+            return
+        log(f"[{name}] 忽略过期 pending 残留（{human_gap(time.time() - pt)} 前）")
 
     if not ignore_limits:
         h = now.tm_hour
@@ -397,28 +408,49 @@ def tick_bot(bcfg, state, name, ignore_limits=False, force=False, respect_interv
             log(f"[{name}] 用户 {human_gap(idle)} 前刚活跃 < {bcfg['min_idle_hours']}h，跳过")
             return
 
+    # 保底主动：用户太久没联系（≥ max_silence_hours）且距上次主动也超过该时长
+    # → 跳过"要不要"判断直接生成一条，避免大脑一直 SKIP 导致永远不主动找用户
+    silence_force = False
+    ms = bcfg.get("max_silence_hours", 0) or 0
+    if not force and not ignore_limits and ms > 0:
+        act0 = last_activity_ts(mem_bot)
+        idle0 = time.time() - act0 if act0 else 10 ** 9
+        if idle0 >= ms * 3600 and time.time() - bs.get("last_sent_ts", 0) >= ms * 3600:
+            silence_force = True
+            log(f"[{name}] 用户已 {human_gap(idle0)} 未联系 ≥ {ms}h，触发保底主动")
+
     # 组装情境
+    use_force = force or silence_force
     act = last_activity_ts(mem_bot)
     idle_str = human_gap(time.time() - act) if act else "未知（还没有对话记录）"
     prompt = build_prompt(mem_bot, now, idle_str,
                           bs.get("sent_today", 0), bs.get("last_proactive", ""),
-                          force=force)
+                          force=use_force)
 
-    log(f"[{name}] 询问大脑（model={bcfg['brain_model']}{'，force' if force else ''}）…")
+    log(f"[{name}] 询问大脑（model={bcfg['brain_model']}{'，force' if use_force else ''}）…")
     out = ask_brain(bcfg, prompt)
-    if force:
-        msg = (out or "").strip().strip("`").strip()
+    if not out:
+        # 调用失败/超时和 SKIP 是两回事，分开记录，便于排查"从不主动"
+        bs["last_decision"] = "大脑调用失败"
+        bs["last_decision_ts"] = int(time.time())
+        log(f"[{name}] 大脑无输出（调用失败/超时），本轮跳过")
+        return
+    if use_force:
+        msg = out.strip().strip("`").strip()
         if len(msg) > 1500:
             msg = msg[:1500] + "…"
         msg = msg or None
     else:
         msg = parse_decision(out)
+    bs["last_decision_ts"] = int(time.time())
     if msg is None:
+        bs["last_decision"] = "SKIP"
         log(f"[{name}] 大脑决定 SKIP")
         return
 
     log(f"[{name}] 大脑决定主动: {msg[:60]}…")
     if send_to(b, target, msg):
+        bs["last_decision"] = "已发送" + ("（保底）" if silence_force else "")
         bs["last_sent_ts"] = int(time.time())
         bs["sent_today"] = bs.get("sent_today", 0) + 1
         bs["last_proactive"] = msg[:200]
@@ -430,6 +462,7 @@ def tick_bot(bcfg, state, name, ignore_limits=False, force=False, respect_interv
                 log(f"记忆写入失败: {e}")
         log(f"[{name}] 已发送主动消息 ✓")
     else:
+        bs["last_decision"] = "发送失败"
         log(f"[{name}] 发送失败")
 
 
@@ -560,20 +593,18 @@ def tick(ignore_limits=False, force=False, only_bot=None, respect_interval=False
 
 
 def main_loop():
-    log("主动大脑启动（per-bot 配置）")
+    """每分钟轮询一次，各 bot 按自己的 interval（last_check_ts）节流。
+    之前是先睡满整个 interval 才第一次判断：重启后有长达 interval 的盲区，
+    且面板改完配置要等一个旧周期才生效；改成固定 60s 轮询后两者都即时。"""
+    log("主动大脑启动（per-bot 配置，每分钟轮询、按各 bot interval 判断）")
     while True:
-        raw = load_config()
-        # 睡眠周期 = 所有已开启 bot 中最小的 interval（无则 30 分钟兜底）
-        intervals = [bot_config(raw, n)["interval_min"] for n in BOTS
-                     if bot_config(raw, n).get("enabled")]
-        base = min(intervals) if intervals else 30
-        time.sleep(max(60, base * 60))
+        time.sleep(60)
         try:
             tick(respect_interval=True)
         except Exception as e:
             log(f"loop 异常: {e}")
         try:
-            maybe_optimize(raw)        # 每天归并一次零散记忆
+            maybe_optimize(load_config())   # 每天归并一次零散记忆
         except Exception as e:
             log(f"optimize 异常: {e}")
 
