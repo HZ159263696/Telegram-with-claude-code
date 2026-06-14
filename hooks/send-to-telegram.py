@@ -194,8 +194,17 @@ def main():
     for i, line in enumerate(lines):
         try:
             obj = json.loads(line)
-            if obj.get("type") == "user":
-                last_user_idx = i
+            if obj.get("type") != "user":
+                continue
+            # tool_result 在 transcript 里也记成 type==user，必须跳过；否则「以工具调用
+            # 结尾」的回合会把窗口起点设到 tool_result，其后无 assistant 文字 → 提取为空
+            # → 回复被误判空而丢弃（老爸在 Telegram 收不到，2026-06-14 定位）。
+            _c = obj.get("message", {}).get("content", "")
+            if isinstance(_c, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in _c
+            ):
+                continue
+            last_user_idx = i
         except:
             continue
 
@@ -233,9 +242,12 @@ def main():
         try:
             obj = json.loads(line)
             if obj.get("type") == "assistant" and "message" in obj:
-                for block in obj["message"].get("content", []):
-                    if block.get("type") == "text":
-                        texts.append(block["text"])
+                blk = [b["text"] for b in obj["message"].get("content", [])
+                       if b.get("type") == "text"]
+                if blk:
+                    # 只保留「最后一条含文字的 assistant 消息」＝收尾总结：
+                    # 回合中途的工具调用不会把回复挤空，也不会把全过程旁白都发出去。
+                    texts = blk
                 usage = obj["message"].get("usage", {})
                 if usage:
                     total_in += usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
