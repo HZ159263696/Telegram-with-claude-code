@@ -323,6 +323,8 @@ def send_typing_loop(chat_id, token=None, pending_file=None):
 # transcript：检测到回合结束（transcript 写入停止 + 最后一条是 assistant 文本）
 # 就调用 send-to-telegram.py 把回复发出去，不再依赖那个钩子。
 HOOK_SCRIPT     = os.path.expanduser("~/.claude/hooks/send-to-telegram.py")
+# 语音转写脚本（whisper small）：收到 Telegram 语音消息时 subprocess 调用
+VOICE_SCRIPT    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_transcribe.py")
 POLL_INTERVAL   = 2      # 轮询间隔（秒）
 REPLY_IDLE_SECS = 4      # transcript 多少秒不变才算回合结束
 _poll_last_mtime = {}    # tmux_session -> 已处理过的 transcript mtime（防重发）
@@ -958,6 +960,7 @@ class Handler(BaseHTTPRequestHandler):
         text = msg.get("text", "")
         photo = msg.get("photo")
         document = msg.get("document")
+        voice = msg.get("voice") or msg.get("audio")
         caption = msg.get("caption", "")
 
         if not chat_id:
@@ -996,6 +999,28 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(chat_id, "图片下载失败")
                 return
             text = f"{caption}\n\n图片路径：{local_path}".strip() if caption else f"图片路径：{local_path}"
+
+        # Voice / audio message → whisper 转中文文字，当普通文字注入
+        if voice:
+            ogg = self.download_file(voice.get("file_id"), f"voice_{int(time.time())}.ogg")
+            if not ogg:
+                self.reply(chat_id, "语音下载失败")
+                return
+            self.reply(chat_id, "🎤 正在转写语音…")
+            transcript = ""
+            try:
+                r = subprocess.run(["python3", VOICE_SCRIPT, ogg],
+                                   capture_output=True, text=True, timeout=180)
+                transcript = (r.stdout or "").strip()
+                if not transcript and r.stderr:
+                    print(f"[voice] {r.stderr.strip()[:200]}")
+            except Exception as e:
+                print(f"[voice] transcribe error: {e}")
+            if not transcript:
+                self.reply(chat_id, "语音转写失败，没识别出内容，换文字试试？")
+                return
+            self.reply(chat_id, f"🎤 听到：{transcript}")
+            text = f"{caption}\n\n{transcript}".strip() if caption else transcript
 
         if not text:
             return
