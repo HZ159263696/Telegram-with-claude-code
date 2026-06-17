@@ -125,7 +125,7 @@ def feishu_send_reply(message_id: str, text: str) -> bool:
     }).encode()
     url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply"
     last_err = None
-    for attempt in range(3):
+    for attempt in range(6):
         try:
             req = urllib.request.Request(
                 url, body,
@@ -141,7 +141,8 @@ def feishu_send_reply(message_id: str, text: str) -> bool:
         except Exception as e:
             last_err = e
             log(f"feishu send error attempt={attempt+1}: {e}")
-            time.sleep(0.8 * (attempt + 1))
+            # 指数退避 1,2,4,8,16,20s：跨过网络抽风窗口
+            time.sleep(min(2 ** attempt, 20))
     log(f"feishu send FAILED: {last_err}")
     return False
 
@@ -173,7 +174,7 @@ def main():
         log("bad pending time, skip")
         return
 
-    if time.time() - pending_time > 600:
+    if time.time() - pending_time > 1800:
         os.remove(PENDING_FILE)
         log("pending expired, skip")
         return
@@ -236,32 +237,47 @@ def main():
             if human_user_text:
                 break
 
-    texts = []
-    total_in, total_out = 0, 0
-    for line in lines[last_user_idx + 1:]:
-        try:
-            obj = json.loads(line)
-            if obj.get("type") == "assistant" and "message" in obj:
-                blk = [b["text"] for b in obj["message"].get("content", [])
-                       if b.get("type") == "text"]
-                if blk:
-                    # 只保留「最后一条含文字的 assistant 消息」＝收尾总结：
-                    # 回合中途的工具调用不会把回复挤空，也不会把全过程旁白都发出去。
-                    texts = blk
-                usage = obj["message"].get("usage", {})
-                if usage:
-                    total_in += usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
-                    total_out += usage.get("output_tokens", 0)
-        except:
-            continue
+    def _extract(_lines):
+        texts = []
+        ti, to = 0, 0
+        for line in _lines[last_user_idx + 1:]:
+            try:
+                obj = json.loads(line)
+                if obj.get("type") == "assistant" and "message" in obj:
+                    blk = [b["text"] for b in obj["message"].get("content", [])
+                           if b.get("type") == "text"]
+                    if blk:
+                        # 只保留「最后一条含文字的 assistant 消息」＝收尾总结：
+                        # 回合中途的工具调用不会把回复挤空，也不会把全过程旁白都发出去。
+                        texts = blk
+                    usage = obj["message"].get("usage", {})
+                    if usage:
+                        ti += usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+                        to += usage.get("output_tokens", 0)
+            except:
+                continue
+        return "\n\n".join(texts).strip(), ti, to
 
-    text = "\n\n".join(texts).strip()
+    text, total_in, total_out = _extract(lines)
+    # 提取为空多半是 Stop 早于 transcript 落盘（时序），或被 API 错误打断：
+    # 重读重试几次，扛住「回答了但还没 flush」→ 否则回复被误判空而丢弃（老爸常遇）。
+    for _retry in range(3):
+        if text:
+            break
+        time.sleep(1.2)
+        try:
+            lines = open(transcript_path).readlines()
+        except Exception:
+            break
+        text, total_in, total_out = _extract(lines)
+        log(f"empty-retry {_retry+1}: len={len(text)}")
+
     assistant_raw = text   # 写记忆用：保留未经 HTML 转换的原文
     log(f"extracted: len={len(text)} preview={text[:100]}")
 
     if not text:
         os.remove(PENDING_FILE)
-        log("empty text, skip")
+        log("empty text after retries, skip")
         return
 
     # ── 飞书回复（纯文本，长回复分段多条发送）─────────────────────────────────
@@ -298,7 +314,7 @@ def main():
                 payload["parse_mode"] = mode
             body = json.dumps(payload).encode()
             last_err = None
-            for attempt in range(3):
+            for attempt in range(6):
                 try:
                     req = urllib.request.Request(
                         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -313,8 +329,9 @@ def main():
                 except Exception as e:
                     last_err = e
                     log(f"send error mode={mode} attempt={attempt+1}: {e}")
-                    time.sleep(0.8 * (attempt + 1))
-            log(f"send FAILED after 3 attempts: {last_err}")
+                    # 指数退避 1,2,4,8,16,20s：跨过 SSL/网络抽风窗口再重试，别几秒内撞死
+                    time.sleep(min(2 ** attempt, 20))
+            log(f"send FAILED after 6 attempts: {last_err}")
             return False
 
         # 按段落边界拆 ≤3800 字的块（HTML 转换有膨胀余量），逐条发送
