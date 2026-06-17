@@ -1911,6 +1911,23 @@ def _register_all_webhooks(tunnel_url):
             telegram_api("setMyCommands", {"commands": BOT_COMMANDS}, token=token)
 
 
+def outbox_flush_loop():
+    """第三道防线：定时补发各 Bot 的 outbox 积压。不依赖 Stop/poller 触发——
+    即使老爸不再发消息，网络一恢复也会把之前没发出去的回复补发出去。
+    走 hook 的 --flush-all（内部 per-bot flock，不会和正常发送并发重复）。"""
+    while True:
+        time.sleep(60)
+        try:
+            subprocess.run(
+                ["python3", HOOK_SCRIPT, "--flush-all"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=120,
+            )
+        except Exception as e:
+            print(f"[outbox] flush error: {e}")
+
+
 def main():
     if not BOT_TOKEN:
         print("Error: TELEGRAM_BOT_TOKEN not set")
@@ -1942,6 +1959,9 @@ def main():
     # 回复轮询线程：不依赖 Stop 钩子，回合结束后主动发回复
     threading.Thread(target=reply_poller, daemon=True).start()
     print("[poller] reply poller started (Stop-hook independent)")
+    # outbox 补发线程：定时把没发出去的回复补发（第三道防线）
+    threading.Thread(target=outbox_flush_loop, daemon=True).start()
+    print("[outbox] flush loop started")
     try:
         # ThreadingHTTPServer so dashboard SSE streams don't block webhooks.
         ThreadingHTTPServer.allow_reuse_address = True
