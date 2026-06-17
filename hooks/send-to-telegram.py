@@ -472,8 +472,11 @@ def main():
     log(f"extracted: len={len(text)} preview={text[:100]}")
 
     if not text:
-        os.remove(PENDING_FILE)
-        log("empty text after retries, skip")
+        # 关键：empty 不删 pending！empty 多半是 poller(REPLY_IDLE_SECS=4s)在 thinking/
+        # 工具调用停顿期误触发、回合还没真出 text。若删了 pending，等回合真正结束、出了
+        # text 的那次 Stop 就会「no pending skip」→ 回复永久丢失（老爸"又没发"根因）。
+        # 保留 pending，让真正出 text 的那次 Stop 来发；最坏靠 1800s 过期兜底清理。
+        log("empty text, KEEP pending (wait for real reply)")
         return
 
     # ── 防线2+3：分段→指纹去重→落 outbox→发送（成功才记账移除）──────────────
