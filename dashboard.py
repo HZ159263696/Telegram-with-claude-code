@@ -70,7 +70,7 @@ BOTS = {
         "pending_file": os.path.expanduser("~/.claude/telegram_pending_stock"),
         "chat_id_file":os.path.expanduser("~/.claude/telegram_chat_id_stock"),
         "work_dir":     "/mnt/d/cao_stock",
-        "default_model":"claude-sonnet-4-6",
+        "default_model":"claude-sonnet-5",
         "bridge_managed": True,
     },
     "feishu": {
@@ -81,7 +81,7 @@ BOTS = {
         "pending_file": os.path.expanduser("~/.claude/telegram_pending_feishu"),
         "chat_id_file":os.path.expanduser("~/.claude/feishu_chat_id"),
         "work_dir":     "/mnt/d/AI/feishu_workspace",
-        "default_model":"claude-sonnet-4-6",
+        "default_model":"claude-sonnet-5",
         "bridge_managed": False,  # 独立进程 feishu_bridge.py，不接收 telegram bridge 全局日志
     },
 }
@@ -289,7 +289,7 @@ def save_memory(bot, fn, content):
     return {"ok": True}
 
 # Claude model provider detection
-_CLAUDE_MODELS = {"claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"}
+_CLAUDE_MODELS = {"claude-fable-5", "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001"}
 # Non-Claude models need CLI alias for LiteLLM routing
 _CLI_MODEL_ALIAS = {
     "deepseek-v4-flash": "claude-3-5-sonnet-20241022",
@@ -320,7 +320,7 @@ _THINK_BUDGET = {
 _MODEL_THINK = {
     "claude-fable-5":            ["medium", "high", "xhigh", "max"],
     "claude-opus-4-8":           ["medium", "high", "xhigh", "max"],
-    "claude-sonnet-4-6":         ["medium", "high", "xhigh", "max"],
+    "claude-sonnet-5":         ["medium", "high", "xhigh", "max"],
     "claude-haiku-4-5-20251001": [],
     "deepseek-v4-pro":           ["medium", "high", "xhigh", "max"],
     "deepseek-v4-flash":         ["medium", "high"],
@@ -1415,7 +1415,7 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
   <div class="model-trigger-icon" id="triggerIcon">🤖</div>
   <div class="model-trigger-info">
     <div class="model-trigger-label">当前模型</div>
-    <div class="model-trigger-name" id="triggerName">Claude Sonnet 4.6</div>
+    <div class="model-trigger-name" id="triggerName">Claude Sonnet 5</div>
     <div class="model-trigger-prov" id="triggerProv">Anthropic</div>
   </div>
   <div class="model-trigger-arrow" id="triggerArrow">▾</div>
@@ -1501,7 +1501,7 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
     <div class="kr"><label>大脑模型</label>
       <select id="p-model" style="flex:1;padding:6px;border-radius:8px">
         <option value="claude-haiku-4-5-20251001">Haiku 4.5（快·省额度）</option>
-        <option value="claude-sonnet-4-6">Sonnet 4.6（均衡）</option>
+        <option value="claude-sonnet-5">Sonnet 5（均衡）</option>
         <option value="claude-opus-4-8">Opus 4.8（最强 Opus）</option>
         <option value="claude-fable-5">Fable 5（最新旗舰）</option>
       </select>
@@ -1545,7 +1545,7 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
       <div class="sheet-title">选择模型</div>
       <button class="sheet-close" onclick="closeSheet()">✕</button>
     </div>
-    <div class="sheet-subtitle" id="sheetSub">共 10 个模型 · 已选：Claude Sonnet 4.6</div>
+    <div class="sheet-subtitle" id="sheetSub">共 10 个模型 · 已选：Claude Sonnet 5</div>
   </div>
   <div class="sheet-body" id="sheetBody"></div>
 </div>
@@ -1556,7 +1556,7 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
 const MODELS=[
   {id:"claude-fable-5",   name:"Claude Fable 5",     prov:"Anthropic", icon:"✨", desc:"最新旗舰，顶级推理能力",  badge:"new",    badgeTxt:"NEW",   think:["medium","high","xhigh","max"]},
   {id:"claude-opus-4-8",  name:"Claude Opus 4.8",    prov:"Anthropic", icon:"🟣", desc:"最强 Opus，复杂任务首选", badge:"smart",  badgeTxt:"SMART", think:["medium","high","xhigh","max"]},
-  {id:"claude-sonnet-4-6",name:"Claude Sonnet 4.6",  prov:"Anthropic", icon:"🔵", desc:"均衡性能，日常主力",      badge:"fast",   badgeTxt:"FAST",  think:["medium","high","xhigh","max"]},
+  {id:"claude-sonnet-5",name:"Claude Sonnet 5",  prov:"Anthropic", icon:"🔵", desc:"均衡性能，日常主力",      badge:"fast",   badgeTxt:"FAST",  think:["medium","high","xhigh","max"]},
   {id:"claude-haiku-4-5-20251001",name:"Claude Haiku 4.5",prov:"Anthropic",icon:"⚪",desc:"超快响应，轻量任务",   badge:"cheap",  badgeTxt:"LITE",  think:[]},
   {id:"deepseek-v4-flash",name:"DeepSeek V4 Flash",   prov:"DeepSeek",  icon:"🐋", desc:"经济快速，1M 上下文",    badge:"fast",   badgeTxt:"FAST",  think:["medium","high"]},
   {id:"deepseek-v4-pro",  name:"DeepSeek V4 Pro",     prov:"DeepSeek",  icon:"🧠", desc:"旗舰思考模式，1M 上下文",badge:"reason", badgeTxt:"THINK", think:["medium","high","xhigh","max"]},
@@ -1576,7 +1576,7 @@ const THINK_LEVELS=[
 const THINK_LABEL=Object.fromEntries(THINK_LEVELS.map(t=>[t.id,t.label]));
 
 const BOT_NAMES={main:"主控Bot",stock:"股票Bot",feishu:"飞书Bot"};
-let paused=false,isRunning=false,curModel="claude-sonnet-4-6",curThink="",curBot=(BOT_NAMES[localStorage.getItem("dash_curBot")]?localStorage.getItem("dash_curBot"):"main");
+let paused=false,isRunning=false,curModel="claude-sonnet-5",curThink="",curBot=(BOT_NAMES[localStorage.getItem("dash_curBot")]?localStorage.getItem("dash_curBot"):"main");
 
 function switchBot(bot){
   if(bot===curBot)return;

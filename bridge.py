@@ -81,7 +81,7 @@ MODELS = [
     # (model_id, display_label, provider, has_thinking)
     ("claude-fable-5",            "Fable 5 — 最新旗舰",       "claude",   True),
     ("claude-opus-4-8",           "Opus 4.8 — 最强 Opus",     "claude",   True),
-    ("claude-sonnet-4-6",         "Sonnet 4.6 — 均衡",        "claude",   True),
+    ("claude-sonnet-5",         "Sonnet 5 — 均衡",        "claude",   True),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — 最快",         "claude",   False),
     ("deepseek-v4-flash",         "DeepSeek V4 Flash — 经济",  "deepseek", True),
     ("deepseek-v4-pro",           "DeepSeek V4 Pro — 旗舰",    "deepseek", True),
@@ -93,7 +93,7 @@ MODELS = [
 ]
 
 PROVIDERS = {
-    "claude":   ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    "claude":   ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001"],
     "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro"],
     "zhipu":    ["glm-4-plus", "glm-4-flash"],
     "minimax":  ["abab6.5s-chat"],
@@ -148,7 +148,7 @@ THINK_BUDGET = {"medium": 8000, "high": 16000, "xhigh": 24000, "max": 31999}
 MODEL_THINK = {
     "claude-fable-5":            ["medium", "high", "xhigh", "max"],
     "claude-opus-4-8":           ["medium", "high", "xhigh", "max"],
-    "claude-sonnet-4-6":         ["medium", "high", "xhigh", "max"],
+    "claude-sonnet-5":         ["medium", "high", "xhigh", "max"],
     "claude-haiku-4-5-20251001": [],
     "deepseek-v4-pro":           ["medium", "high", "xhigh", "max"],
     "deepseek-v4-flash":         ["medium", "high"],

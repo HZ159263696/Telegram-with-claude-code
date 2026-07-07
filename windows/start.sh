@@ -101,10 +101,10 @@ if [ -n "$TMUX" ]; then
     echo "[1.5] Starting tmux session 'claude_stock' (股票Bot)..."
     tmux kill-session -t claude_stock 2>/dev/null || true
     STOCK_MODEL_FILE="$HOME/.claude/telegram_model_stock"
-    STOCK_MODEL="claude-sonnet-4-6"
+    STOCK_MODEL="claude-sonnet-5"
     if [ -f "$STOCK_MODEL_FILE" ]; then
         STOCK_MODEL=$(cat "$STOCK_MODEL_FILE" | tr -d '[:space:]')
-        [ -z "$STOCK_MODEL" ] && STOCK_MODEL="claude-sonnet-4-6"
+        [ -z "$STOCK_MODEL" ] && STOCK_MODEL="claude-sonnet-5"
     fi
     tmux new-session -d -s claude_stock -c /mnt/d/cao_stock \
         "claude --dangerously-skip-permissions --model $STOCK_MODEL"
@@ -114,10 +114,10 @@ if [ -n "$TMUX" ]; then
     echo "[1.6] Starting tmux session 'claude_feishu' (飞书Bot)..."
     tmux kill-session -t claude_feishu 2>/dev/null || true
     FEISHU_MODEL_FILE="$HOME/.claude/telegram_model_feishu"
-    FEISHU_MODEL="claude-sonnet-4-6"
+    FEISHU_MODEL="claude-sonnet-5"
     if [ -f "$FEISHU_MODEL_FILE" ]; then
         FEISHU_MODEL=$(cat "$FEISHU_MODEL_FILE" | tr -d '[:space:]')
-        [ -z "$FEISHU_MODEL" ] && FEISHU_MODEL="claude-sonnet-4-6"
+        [ -z "$FEISHU_MODEL" ] && FEISHU_MODEL="claude-sonnet-5"
     fi
     mkdir -p /mnt/d/AI/feishu_workspace
     # 部署飞书发文件助手（Claude 在 session 内调用，把文件发回飞书群）
