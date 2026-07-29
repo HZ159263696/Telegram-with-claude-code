@@ -97,12 +97,16 @@ PROACTIVE_CONFIG  = os.path.expanduser("~/.claude/proactive_config.json")
 PROACTIVE_STATE   = os.path.expanduser("~/.claude/proactive_state.json")
 MEM_ROOT          = os.path.expanduser("~/.claude/memory")
 MEM_FILES         = ["MEMORY.md", "PROJECTS.md", "PENDING.md", "RECENT.md"]
+PROACTIVE_MODEL_DEFAULT = "codex-subscription"
+PROACTIVE_GPT_MODELS = {
+    PROACTIVE_MODEL_DEFAULT, "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"
+}
 # 默认值需与 proactive.py 的 DEFAULT_BOT / DEFAULT_ENABLED 保持一致（per-bot 配置）
 PROACTIVE_BOT_DEFAULT = {
     "interval_min": 30, "quiet_start": 23, "quiet_end": 8,
     "min_gap_hours": 4, "max_per_day": 4, "min_idle_hours": 2,
     "max_silence_hours": 24,
-    "brain_model": "claude-haiku-4-5-20251001",
+    "brain_model": PROACTIVE_MODEL_DEFAULT,
     "optimize_enabled": True, "optimize_model": "",
 }
 PROACTIVE_DEFAULT_ENABLED = {"main": True, "stock": False, "feishu": False}
@@ -217,6 +221,11 @@ def _bot_proactive_cfg(raw, bot):
     b["enabled"] = PROACTIVE_DEFAULT_ENABLED.get(bot, False)
     if isinstance(raw, dict) and isinstance(raw.get(bot), dict):
         b.update(raw[bot])
+    # 旧版持久配置中的 Claude/其它模型在读取时自动回退到 GPT 订阅。
+    if b.get("brain_model") not in PROACTIVE_GPT_MODELS:
+        b["brain_model"] = PROACTIVE_MODEL_DEFAULT
+    if b.get("optimize_model") and b["optimize_model"] not in PROACTIVE_GPT_MODELS:
+        b["optimize_model"] = ""
     return b
 
 
@@ -247,11 +256,14 @@ def save_proactive_config(bot, data):
             except Exception:
                 pass
     if data.get("brain_model"):
-        cur["brain_model"] = str(data["brain_model"])
+        requested = str(data["brain_model"])
+        cur["brain_model"] = (requested if requested in PROACTIVE_GPT_MODELS
+                              else PROACTIVE_MODEL_DEFAULT)
     if "optimize_enabled" in data:
         cur["optimize_enabled"] = bool(data["optimize_enabled"])
     if "optimize_model" in data:
-        cur["optimize_model"] = str(data["optimize_model"] or "")
+        requested = str(data["optimize_model"] or "")
+        cur["optimize_model"] = (requested if requested in PROACTIVE_GPT_MODELS else "")
     raw[bot] = cur
     with open(PROACTIVE_CONFIG, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
@@ -296,7 +308,6 @@ _CLI_MODEL_ALIAS = {
     "deepseek-v4-pro":   "claude-3-opus-20240229",
     "glm-4-plus":        "claude-3-sonnet-20240229",
     "glm-4-flash":       "claude-3-haiku-20240307",
-    "abab6.5s-chat":     "claude-3-5-haiku-20241022",
     "qwen-max":          "claude-3-5-sonnet-latest",
     "qwen-plus":         "claude-3-opus-latest",
     "qwen-turbo":        "claude-3-haiku-20240307",
@@ -307,6 +318,10 @@ _NATIVE_ANTHROPIC_BASE = {
     "deepseek-v4-flash": "https://api.deepseek.com/anthropic",
     "deepseek-v4-pro":   "https://api.deepseek.com/anthropic",
 }
+_DIRECT_NETWORK_PREFIX = (
+    "env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY "
+    "-u ALL_PROXY -u all_proxy NO_PROXY='*' no_proxy='*' "
+)
 
 # ── 思考档位（reasoning effort）─────────────────────────────────────────────────
 # 档位 → MAX_THINKING_TOKENS 预算（仅对走 Claude Code CLI / Anthropic 端点的模型生效）
@@ -324,6 +339,9 @@ _MODEL_THINK = {
     "claude-haiku-4-5-20251001": [],
     "deepseek-v4-pro":           ["medium", "high", "xhigh", "max"],
     "deepseek-v4-flash":         ["medium", "high"],
+    "gpt-5.6-sol":               ["medium", "high", "xhigh", "max"],
+    "gpt-5.6-terra":             ["medium", "high", "xhigh", "max"],
+    "gpt-5.6-luna":              ["medium", "high", "xhigh", "max"],
 }
 
 
@@ -347,8 +365,6 @@ def _get_provider_key(model):
         return keys.get("deepseek", "")
     if model.startswith("glm"):
         return keys.get("zhipu", "")
-    if model.startswith("abab"):
-        return keys.get("minimax", "")
     if model.startswith("qwen"):
         return keys.get("bailian", "")
     return ""
@@ -397,6 +413,10 @@ def _relaunch_claude(model, bot_key="main", thinking=None):
 
     thinking: 思考档位 id（medium/high/xhigh/max）或 None；对支持的模型注入 MAX_THINKING_TOKENS。"""
     profile = _bot_or_default(bot_key)
+    if model in CODEX_SUBSCRIPTION_MODELS:
+        _log(f"[{profile['name']}] 已切换到 Codex 订阅模型 {model}（下一条 Bot 消息将由 Codex CLI 执行）",
+             bot_key=bot_key)
+        return
     sess     = profile["tmux_session"]
     work_dir = profile.get("work_dir")
     name     = profile["name"]
@@ -426,11 +446,11 @@ def _relaunch_claude(model, bot_key="main", thinking=None):
             base = _NATIVE_ANTHROPIC_BASE[model]
             key = _get_provider_key(model)
             _approve_custom_key(key)
-            cmd = f"{think_pre}ANTHROPIC_API_KEY={key} ANTHROPIC_BASE_URL={base} claude --dangerously-skip-permissions --model {model}"
+            cmd = f"{_DIRECT_NETWORK_PREFIX}{think_pre}ANTHROPIC_API_KEY={key} ANTHROPIC_BASE_URL={base} claude --dangerously-skip-permissions --model {model}"
         else:
             _approve_custom_key("sk-placeholder")
             cli_model = _CLI_MODEL_ALIAS.get(model, model)
-            cmd = f"ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL={ANTHROPIC_PROXY_URL} claude --dangerously-skip-permissions --model {cli_model}"
+            cmd = f"{_DIRECT_NETWORK_PREFIX}ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL={ANTHROPIC_PROXY_URL} claude --dangerously-skip-permissions --model {cli_model}"
         subprocess.run(["tmux", "send-keys", "-t", sess, cmd, "Enter"])
         _log(f"[{name}] Claude Code relaunched with model: {model}"
              + (f" (thinking={thinking})" if think_pre else ""), bot_key=bot_key)
@@ -641,7 +661,17 @@ def _log_claude(line, bot_key="main"):
 # 直接 tail 各 Bot 的 transcript JSONL（含结构化 thinking/text/tool_use 块），
 # 取代 tmux 抓屏：无 ANSI 噪音、无去重 hack，前端可按 Claude 桌面端风格分开渲染。
 CLAUDE_EVT_MARK = "@@CLAUDE@@"   # SSE 行前缀，前端据此解析 JSON 并结构化渲染
-_tail_states = {k: {"path": None, "offset": 0} for k in BOTS}
+CODEX_SUBSCRIPTION_MODEL = "codex-subscription"
+CODEX_SUBSCRIPTION_MODELS = {
+    CODEX_SUBSCRIPTION_MODEL, "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"
+}
+CODEX_EVENT_DIR = os.path.expanduser("~/.claude/codex_bridge")
+_tail_states = {k: {"source": None, "source_since": 0,
+                    "path": None, "offset": 0} for k in BOTS}
+# Codex 每个消息来源使用独立 JSONL 文件前缀。飞书股票 Bot 不单独占用
+# Dashboard 页签，而是作为第二路事件流汇入现有 stock 实时日志。
+CODEX_AUX_EVENT_SOURCES = {"stock": ("feishu_stock",)}
+_codex_tail_states = {}
 
 
 def _session_cwd(session):
@@ -666,6 +696,33 @@ def _newest_transcript(profile):
     d = _transcript_dir(profile)
     try:
         files = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".jsonl")]
+        return max(files, key=os.path.getmtime) if files else None
+    except Exception:
+        return None
+
+
+def _current_profile_model(profile):
+    try:
+        model = open(profile["model_file"], encoding="utf-8").read().strip()
+        if model:
+            return model
+    except Exception:
+        pass
+    return profile.get("default_model", "")
+
+
+def _profile_log_source(profile):
+    """Codex 订阅读取其事件流，其余模型保持原 Claude transcript 路径。"""
+    return ("codex" if _current_profile_model(profile) in CODEX_SUBSCRIPTION_MODELS
+            else "claude")
+
+
+def _newest_codex_event(source_key):
+    try:
+        prefix = f"{source_key}-"
+        files = [os.path.join(CODEX_EVENT_DIR, name)
+                 for name in os.listdir(CODEX_EVENT_DIR)
+                 if name.startswith(prefix) and name.endswith(".jsonl")]
         return max(files, key=os.path.getmtime) if files else None
     except Exception:
         return None
@@ -729,6 +786,115 @@ def _handle_transcript_line(bot_key, line):
                     _emit_claude_event(bot_key, "result", snippet[:160])
 
 
+def _codex_text(value):
+    """宽松提取 Codex item 中的可显示文本，兼容 CLI 小版本字段变化。"""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(filter(None, (_codex_text(v) for v in value))).strip()
+    if isinstance(value, dict):
+        for key in ("text", "content", "message", "summary", "output"):
+            text = _codex_text(value.get(key))
+            if text:
+                return text
+    return ""
+
+
+def _codex_item_text(item):
+    for key in ("text", "summary", "content", "message"):
+        text = _codex_text(item.get(key))
+        if text:
+            return text
+    return ""
+
+
+def _compact_codex_text(value, limit=160):
+    text = " ".join(_codex_text(value).split())
+    return text[:limit]
+
+
+def _codex_tool_label(item):
+    item_type = item.get("type", "")
+    if item_type == "command_execution":
+        command = " ".join(str(item.get("command", "")).split())[:120]
+        return f"Shell({command})" if command else "Shell"
+    if item_type in ("mcp_tool_call", "tool_call"):
+        server = item.get("server") or item.get("server_name") or ""
+        name = item.get("tool") or item.get("name") or "Tool"
+        full_name = f"{server}.{name}" if server else str(name)
+        args = item.get("arguments") or item.get("input") or {}
+        arg = _summarize_tool_input(args)
+        return f"{full_name}({arg})" if arg else full_name
+    if item_type == "web_search":
+        query = item.get("query") or item.get("search_query") or ""
+        query = " ".join(str(query).split())[:120]
+        return f"WebSearch({query})" if query else "WebSearch"
+    if item_type == "file_change":
+        paths = []
+        for change in item.get("changes") or []:
+            if isinstance(change, dict) and change.get("path"):
+                paths.append(str(change["path"]))
+        arg = ", ".join(paths[:3])[:120]
+        return f"FileChange({arg})" if arg else "FileChange"
+    return ""
+
+
+def _codex_tool_result(item):
+    item_type = item.get("type", "")
+    if item_type == "command_execution":
+        output = _compact_codex_text(item.get("aggregated_output"))
+        exit_code = item.get("exit_code")
+        if output:
+            return output
+        if exit_code is not None:
+            return f"exit {exit_code}"
+        return str(item.get("status") or "completed")
+    if item_type in ("mcp_tool_call", "tool_call", "web_search"):
+        for key in ("result", "output", "error"):
+            output = _compact_codex_text(item.get(key))
+            if output:
+                return output
+        return str(item.get("status") or "completed")
+    return ""
+
+
+def _handle_codex_line(bot_key, line):
+    try:
+        obj = json.loads(line)
+    except Exception:
+        return
+    event_type = obj.get("type", "")
+    item = obj.get("item")
+
+    if event_type in ("error", "turn.failed"):
+        error = obj.get("error") or obj.get("message") or "Codex error"
+        _emit_claude_event(bot_key, "result", _compact_codex_text(error))
+        return
+    if not isinstance(item, dict):
+        return
+
+    item_type = item.get("type", "")
+    if event_type == "item.started":
+        tool = _codex_tool_label(item)
+        if tool:
+            _emit_claude_event(bot_key, "tool", tool)
+        return
+    if event_type != "item.completed":
+        return
+
+    if item_type == "agent_message":
+        _emit_claude_event(bot_key, "text", _codex_item_text(item))
+    elif item_type == "reasoning":
+        _emit_claude_event(bot_key, "think", _codex_item_text(item))
+    elif item_type == "file_change":
+        _emit_claude_event(bot_key, "tool", _codex_tool_label(item))
+        _emit_claude_event(bot_key, "result", str(item.get("status") or "completed"))
+    else:
+        result = _codex_tool_result(item)
+        if result:
+            _emit_claude_event(bot_key, "result", result)
+
+
 def _tail_one_bot(bot_key):
     profile = _bot_or_default(bot_key)
     st = _tail_states[bot_key]
@@ -763,11 +929,65 @@ def _tail_one_bot(bot_key):
     st["offset"] += end + 1
 
 
+def _tail_one_codex_source(bot_key, source_key):
+    """把一个 Codex 文件前缀的实时事件汇入指定 Dashboard Bot。"""
+    st = _codex_tail_states.setdefault(
+        source_key,
+        {"source_since": time.time(), "path": None, "offset": 0},
+    )
+    path = _newest_codex_event(source_key)
+    if not path:
+        return
+    if path != st["path"]:
+        # Dashboard/模式刚切换时跳过历史；新的 Codex 回合文件则从头读取。
+        if st["path"] is None:
+            is_fresh = os.path.getmtime(path) >= st.get("source_since", 0) - 2
+            st["offset"] = 0 if is_fresh else os.path.getsize(path)
+        else:
+            st["offset"] = 0
+        st["path"] = path
+    try:
+        size = os.path.getsize(path)
+        if size < st["offset"]:
+            st["offset"] = 0
+        if size == st["offset"]:
+            return
+        with open(path, "rb") as f:
+            f.seek(st["offset"])
+            data = f.read()
+    except Exception:
+        return
+    end = data.rfind(b"\n")
+    if end < 0:
+        return
+    for raw in data[:end].split(b"\n"):
+        line = raw.decode("utf-8", "replace").strip()
+        if line:
+            try:
+                _handle_codex_line(bot_key, line)
+            except Exception:
+                pass
+    st["offset"] += end + 1
+
+
 def _transcript_tail_loop():
     while True:
         for bot_key in BOTS:
             try:
-                _tail_one_bot(bot_key)
+                profile = _bot_or_default(bot_key)
+                source = _profile_log_source(profile)
+                st = _tail_states[bot_key]
+                if st["source"] != source:
+                    st.update({"source": source, "source_since": time.time(),
+                               "path": None, "offset": 0})
+                if source == "codex":
+                    _tail_one_codex_source(bot_key, bot_key)
+                else:
+                    _tail_one_bot(bot_key)
+                # 红 Bot 始终由 Codex 后台进程执行，不能受 Telegram 股票 Bot
+                # 当前所选模型影响；独立 tail 也允许两个股票入口同时工作。
+                for source_key in CODEX_AUX_EVENT_SOURCES.get(bot_key, ()):
+                    _tail_one_codex_source(bot_key, source_key)
             except Exception:
                 pass
         time.sleep(1)
@@ -1472,7 +1692,6 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
   <div class="keys-body">
     <div class="kr"><label>DeepSeek</label><input id="k-ds" type="password" placeholder="sk-..."><span class="eye" onclick="toggleKey(this)" title="显示/隐藏">👁</span></div>
     <div class="kr"><label>智谱AI</label><input id="k-zp" type="password" placeholder="id.secret"><span class="eye" onclick="toggleKey(this)" title="显示/隐藏">👁</span></div>
-    <div class="kr"><label>MiniMax</label><input id="k-mm" type="password" placeholder="sk-api-..."><span class="eye" onclick="toggleKey(this)" title="显示/隐藏">👁</span></div>
     <div class="kr"><label>百炼</label><input id="k-bl" type="password" placeholder="sk-..."><span class="eye" onclick="toggleKey(this)" title="显示/隐藏">👁</span></div>
     <button class="save-btn" onclick="saveKeys()">保存 API Keys</button>
   </div>
@@ -1500,10 +1719,10 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
     <div class="kr"><label>保底主动</label><span><input id="p-silence" type="number" min="0" style="width:70px"> 小时没联系必主动（0=关闭）</span></div>
     <div class="kr"><label>大脑模型</label>
       <select id="p-model" style="flex:1;padding:6px;border-radius:8px">
-        <option value="claude-haiku-4-5-20251001">Haiku 4.5（快·省额度）</option>
-        <option value="claude-sonnet-5">Sonnet 5（均衡）</option>
-        <option value="claude-opus-4-8">Opus 4.8（最强 Opus）</option>
-        <option value="claude-fable-5">Fable 5（最新旗舰）</option>
+        <option value="codex-subscription">GPT（账号自动选择）</option>
+        <option value="gpt-5.6-sol">GPT-5.6 Sol（最强）</option>
+        <option value="gpt-5.6-terra">GPT-5.6 Terra（均衡）</option>
+        <option value="gpt-5.6-luna">GPT-5.6 Luna（省额度）</option>
       </select>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
@@ -1562,9 +1781,12 @@ const MODELS=[
   {id:"deepseek-v4-pro",  name:"DeepSeek V4 Pro",     prov:"DeepSeek",  icon:"🧠", desc:"旗舰思考模式，1M 上下文",badge:"reason", badgeTxt:"THINK", think:["medium","high","xhigh","max"]},
   {id:"glm-4-plus",       name:"GLM-4 Plus",          prov:"ZhipuAI",   icon:"🌸", desc:"智谱旗舰，中文优化",     badge:"smart",  badgeTxt:"SMART", think:[]},
   {id:"glm-4-flash",      name:"GLM-4 Flash",         prov:"ZhipuAI",   icon:"⚡", desc:"闪电响应，低成本",       badge:"cheap",  badgeTxt:"FAST",  think:[]},
-  {id:"abab6.5s-chat",    name:"MiniMax 6.5s",        prov:"MiniMax",   icon:"🎭", desc:"多模态，长上下文",        badge:"smart",  badgeTxt:"MULTI", think:[]},
   {id:"qwen-max",         name:"通义千问 Max",         prov:"Bailian",   icon:"☁️", desc:"阿里旗舰模型",           badge:"smart",  badgeTxt:"SMART", think:[]},
   {id:"qwen-plus",        name:"通义千问 Plus",        prov:"Bailian",   icon:"🌤", desc:"性价比之选",             badge:"cheap",  badgeTxt:"FAST",  think:[]},
+  {id:"codex-subscription",name:"Codex · 自动选择",     prov:"ChatGPT", icon:"◉", desc:"使用账号当前默认模型",         badge:"new",    badgeTxt:"AUTO", think:[], bots:["main","stock","feishu"]},
+  {id:"gpt-5.6-sol",      name:"GPT-5.6 Sol",          prov:"ChatGPT", icon:"☀️", desc:"最强推理与复杂编码",           badge:"smart",  badgeTxt:"MAX",  think:["medium","high","xhigh","max"], bots:["main","stock","feishu"]},
+  {id:"gpt-5.6-terra",    name:"GPT-5.6 Terra",        prov:"ChatGPT", icon:"🌍", desc:"智能、速度与额度均衡",         badge:"fast",   badgeTxt:"BAL",  think:["medium","high","xhigh","max"], bots:["main","stock","feishu"]},
+  {id:"gpt-5.6-luna",     name:"GPT-5.6 Luna",         prov:"ChatGPT", icon:"🌙", desc:"省额度，适合高频轻量任务",      badge:"cheap",  badgeTxt:"ECO",  think:["medium","high","xhigh","max"], bots:["main","stock","feishu"]},
 ];
 // 思考档位定义（id 与后端 _THINK_BUDGET / MODEL_THINK 一致）
 const THINK_LEVELS=[
@@ -1595,10 +1817,15 @@ function switchBot(bot){
   toast("已切换到 "+(BOT_NAMES[bot]||bot));
 }
 
+function availableModels(){
+  return MODELS.filter(m=>!m.bots||m.bots.includes(curBot));
+}
+
 // Build model sheet
 function buildSheet(){
   const body=document.getElementById("sheetBody");
-  const provs=[...new Set(MODELS.map(m=>m.prov))];
+  const modelList=availableModels();
+  const provs=[...new Set(modelList.map(m=>m.prov))];
   body.innerHTML="";
   provs.forEach((prov,pi)=>{
     const grp=document.createElement("div");
@@ -1606,7 +1833,7 @@ function buildSheet(){
     const lbl=document.createElement("div");
     lbl.className="prov-label";lbl.textContent=prov;
     grp.appendChild(lbl);
-    MODELS.filter(m=>m.prov===prov).forEach(m=>{
+    modelList.filter(m=>m.prov===prov).forEach(m=>{
       const sel=m.id===curModel;
       const row=document.createElement("div");
       row.className="model-item"+(sel?" selected":"");
@@ -1651,7 +1878,7 @@ function selectModel(m){
   if(changed&&!(m.think||[]).includes(curThink))curThink="";
   switchModel(m.id,m,curThink);
   updateTrigger(m);
-  document.getElementById("sheetSub").textContent=`共 ${MODELS.length} 个模型 · 已选：${m.name}`;
+  document.getElementById("sheetSub").textContent=`共 ${availableModels().length} 个模型 · 已选：${m.name}`;
   // 若该模型支持思考档位，展开档位行让用户继续选；否则收起面板
   if((m.think||[]).length){buildSheet();}
   else{
@@ -1739,7 +1966,7 @@ function updateUI(s){
   else whEl.textContent="未连接";
   // update sheet subtitle
   const m=MODELS.find(x=>x.id===curModel);
-  document.getElementById("sheetSub").textContent=`共 ${MODELS.length} 个模型 · 已选：${m?m.name:curModel}`;
+  document.getElementById("sheetSub").textContent=`共 ${availableModels().length} 个模型 · 已选：${m?m.name:curModel}`;
 }
 
 async function fetchStatus(){
@@ -1773,7 +2000,6 @@ async function saveKeys(){
   const keys={
     deepseek:document.getElementById("k-ds").value,
     zhipu:document.getElementById("k-zp").value,
-    minimax:document.getElementById("k-mm").value,
     bailian:document.getElementById("k-bl").value,
   };
   try{
@@ -1786,7 +2012,6 @@ async function loadKeys(){
     const d=await (await fetch("/api/keys")).json();
     if(d.deepseek)document.getElementById("k-ds").value=d.deepseek;
     if(d.zhipu)   document.getElementById("k-zp").value=d.zhipu;
-    if(d.minimax) document.getElementById("k-mm").value=d.minimax;
     if(d.bailian) document.getElementById("k-bl").value=d.bailian;
   }catch(e){}
 }

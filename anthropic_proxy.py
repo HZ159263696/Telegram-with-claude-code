@@ -5,7 +5,7 @@ Anthropic-to-OpenAI Translation Proxy
 Sits between Claude Code CLI and upstream providers:
   Claude Code CLI (Anthropic Messages API)
     → anthropic_proxy.py (port 4001, translates format)
-      → 智谱 / MiniMax / 百炼 (OpenAI-compatible endpoints, direct)
+      → 智谱 / 百炼 (OpenAI-compatible endpoints, direct)
 
 Routes by model alias (CLI_MODEL_ALIAS from bridge.py).
 API keys are read from ~/.claude/telegram_api_keys.json.
@@ -21,14 +21,26 @@ import time as _time
 import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# 本进程只访问国内厂商端点；彻底忽略系统/VPN 代理，避免 VPN 关闭后仍指向
+# 127.0.0.1 失效端口，或国内请求被错误送往境外代理。
+for _proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                   "ALL_PROXY", "all_proxy"):
+    os.environ.pop(_proxy_var, None)
+os.environ["NO_PROXY"] = "*"
+os.environ["no_proxy"] = "*"
+urllib.request.install_opener(
+    urllib.request.build_opener(urllib.request.ProxyHandler({}))
+)
+
 PROXY_PORT = 4001
 API_KEYS_FILE = os.path.expanduser("~/.claude/telegram_api_keys.json")
 
 # CLI model alias → (api_base_url, real_model_name, provider_key)
 _MODEL_ROUTES = {
+    "claude-3-5-sonnet-20241022": ("https://api.deepseek.com",                         "deepseek-v4-flash", "deepseek"),
+    "claude-3-opus-20240229":     ("https://api.deepseek.com",                         "deepseek-v4-pro",   "deepseek"),
     "claude-3-sonnet-20240229":  ("https://open.bigmodel.cn/api/paas/v4",              "glm-4-plus",    "zhipu"),
     "claude-3-haiku-20240307":   ("https://open.bigmodel.cn/api/paas/v4",              "glm-4-flash",   "zhipu"),
-    "claude-3-5-haiku-20241022": ("https://api.minimax.chat/v1",                        "abab6.5s-chat", "minimax"),
     "claude-3-5-sonnet-latest":  ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-max",      "bailian"),
     "claude-3-opus-latest":      ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus",     "bailian"),
 }

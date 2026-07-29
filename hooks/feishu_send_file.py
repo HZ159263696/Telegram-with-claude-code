@@ -18,9 +18,29 @@ import urllib.error
 import urllib.request
 import uuid
 
-APP_ID       = os.environ.get("FEISHU_APP_ID",     "REDACTED_FEISHU_APP_ID")
-APP_SECRET   = os.environ.get("FEISHU_APP_SECRET", "")
-CHAT_ID_FILE = os.path.expanduser("~/.claude/feishu_chat_id")
+def _load_env_file(path):
+    values = {}
+    if not path:
+        return values
+    try:
+        for raw in open(os.path.expanduser(path), encoding="utf-8"):
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip("'\"")
+    except OSError:
+        pass
+    return values
+
+
+_config = _load_env_file(os.environ.get("FEISHU_CONFIG_FILE", ""))
+APP_ID = os.environ.get("FEISHU_APP_ID") or _config.get(
+    "FEISHU_APP_ID", "REDACTED_FEISHU_APP_ID")
+APP_SECRET = os.environ.get("FEISHU_APP_SECRET") or _config.get(
+    "FEISHU_APP_SECRET", "")
+CHAT_ID_FILE = os.path.expanduser(os.environ.get(
+    "FEISHU_CHAT_ID_FILE", "~/.claude/feishu_chat_id"))
 MAX_SIZE     = 30 * 1024 * 1024   # 飞书文件上限 30MB（图片实际上限 10MB，由 API 报错兜底）
 
 IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "ico", "heic"}

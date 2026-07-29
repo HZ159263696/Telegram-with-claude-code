@@ -11,14 +11,32 @@
 source /etc/claude_env.sh 2>/dev/null
 source ~/.profile 2>/dev/null
 
+# Codex CLI 以当前 WSL 用户安装时默认位于 ~/.local/bin。
+if [ -x "$HOME/.local/bin/codex" ]; then
+    export CODEX_EXECUTABLE="${CODEX_EXECUTABLE:-$HOME/.local/bin/codex}"
+fi
+
 TOKEN="${TELEGRAM_BOT_TOKEN}"
 STOCK_TOKEN="${STOCK_BOT_TOKEN}"   # 股票Bot token（可选）
 PROJECT="/mnt/d/AI/claudecode-telegram-main"
+FEISHU_STOCK_CONFIG="$PROJECT/.env.feishu_stock"
 PORT=9999
 
 if [ -z "$TOKEN" ]; then
     echo "ERROR: TELEGRAM_BOT_TOKEN not set"
     exit 1
+fi
+
+# Always deploy the exact hook revision that this bridge release uses.  The
+# Stop hooks execute from ~/.claude/hooks, while bridge.py invokes the project
+# copy directly; allowing the two copies to drift caused fixes to work for one
+# route but not another.  Deployment is idempotent and preserves user memory.
+if [ -x "$PROJECT/windows/deploy_hook.sh" ]; then
+    echo "[hook] Deploying current reply hook..."
+    bash "$PROJECT/windows/deploy_hook.sh" || {
+        echo "ERROR: reply-hook deployment failed; refusing to start an inconsistent bridge."
+        exit 1
+    }
 fi
 
 # Kill any previous bridge instance and free the port
@@ -31,6 +49,31 @@ rm -f /tmp/dashboard_notified_session.flag
 # If already running inside tmux, just do the work directly
 if [ -n "$TMUX" ]; then
     # ── running inside tmux pane ──────────────────────────────────────
+
+    # 非 Claude 模型借用独立 Claude CLI 别名，由本地兼容代理路由到真实模型。
+    proxy_cli_model() {
+        case "$1" in
+            deepseek-chat|deepseek-v4-flash)   echo "claude-3-5-sonnet-20241022" ;;
+            deepseek-reasoner|deepseek-v4-pro) echo "claude-3-opus-20240229" ;;
+            glm-4-plus)                        echo "claude-3-sonnet-20240229" ;;
+            glm-4-flash)                       echo "claude-3-haiku-20240307" ;;
+            qwen-max)                          echo "claude-3-5-sonnet-latest" ;;
+            qwen-plus)                         echo "claude-3-opus-latest" ;;
+            *)                                 echo "$1" ;;
+        esac
+    }
+
+    claude_cmd_for_model() {
+        local model="$1"
+        if [[ "$model" == "codex-subscription" || "$model" == gpt-5.6-* ]]; then
+            # Codex 订阅模式由 bridge 按消息执行 `codex exec`；保留空 tmux pane 供状态/中断命令使用。
+            printf 'echo "Codex subscription mode: bridge runs codex exec per message"; exec bash'
+        elif [[ "$model" == claude-* ]]; then
+            printf 'claude --dangerously-skip-permissions --model %s' "$model"
+        else
+            printf 'env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy NO_PROXY="*" no_proxy="*" ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL=http://localhost:4001 claude --dangerously-skip-permissions --model %s' "$(proxy_cli_model "$model")"
+        fi
+    }
 
     # 0. Start LiteLLM proxy
     echo "[0] Starting LiteLLM proxy on port 4000..."
@@ -51,7 +94,8 @@ if [ -n "$TMUX" ]; then
     fuser -k 4001/tcp 2>/dev/null; sleep 0.3
     PROXY_SCRIPT="$PROJECT/anthropic_proxy.py"
     if [ -f "$PROXY_SCRIPT" ]; then
-        nohup python3 "$PROXY_SCRIPT" > /tmp/anthropic_proxy.log 2>&1 </dev/null &
+        nohup env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+            NO_PROXY="*" no_proxy="*" python3 "$PROXY_SCRIPT" > /tmp/anthropic_proxy.log 2>&1 </dev/null &
         disown
         sleep 1
         echo "    Anthropic proxy started (log: /tmp/anthropic_proxy.log)"
@@ -72,29 +116,7 @@ if [ -n "$TMUX" ]; then
         [ -z "$SAVED_MODEL" ] && SAVED_MODEL="claude-fable-5"
     fi
 
-    # Claude 模型（claude-* 开头）直连 Anthropic；其它（deepseek/glm/minimax/qwen）走本地代理。
-    # 用前缀判断而非硬编码列表，避免每次新增 Claude 模型（如 opus-4-8）漏改导致误走代理。
-    case "$SAVED_MODEL" in
-        claude-*) IS_CLAUDE=true ;;
-        *)        IS_CLAUDE=false ;;
-    esac
-
-    if $IS_CLAUDE; then
-        tmux new-session -d -s claude -c "$PROJECT" "claude --dangerously-skip-permissions --model $SAVED_MODEL"
-    else
-        # Map non-Claude models to CLI aliases for LiteLLM routing
-        case "$SAVED_MODEL" in
-            deepseek-chat)     CLI_MODEL="claude-3-5-sonnet-20241022" ;;
-            deepseek-reasoner) CLI_MODEL="claude-3-opus-20240229" ;;
-            glm-4-plus)        CLI_MODEL="claude-3-sonnet-20240229" ;;
-            glm-4-flash)       CLI_MODEL="claude-3-haiku-20240307" ;;
-            abab6.5s-chat)     CLI_MODEL="claude-3-5-haiku-20241022" ;;
-            qwen-max)          CLI_MODEL="claude-3-5-sonnet-latest" ;;
-            qwen-plus)         CLI_MODEL="claude-3-opus-latest" ;;
-            *)                 CLI_MODEL="$SAVED_MODEL" ;;
-        esac
-        tmux new-session -d -s claude -c "$PROJECT" "ANTHROPIC_API_KEY=sk-placeholder ANTHROPIC_BASE_URL=http://localhost:4001 claude --dangerously-skip-permissions --model $CLI_MODEL"
-    fi
+    tmux new-session -d -s claude -c "$PROJECT" "$(claude_cmd_for_model "$SAVED_MODEL")"
     echo "    tmux session 'claude' started (model: $SAVED_MODEL)."
 
     # 1.5 Start stock Claude Code session (独立股票工作区)
@@ -107,7 +129,7 @@ if [ -n "$TMUX" ]; then
         [ -z "$STOCK_MODEL" ] && STOCK_MODEL="claude-sonnet-5"
     fi
     tmux new-session -d -s claude_stock -c /mnt/d/cao_stock \
-        "claude --dangerously-skip-permissions --model $STOCK_MODEL"
+        "$(claude_cmd_for_model "$STOCK_MODEL")"
     echo "    tmux session 'claude_stock' started in /mnt/d/cao_stock (model: $STOCK_MODEL)"
 
     # 1.6 Start Feishu Claude Code session (飞书Bot 独立工作区)
@@ -123,8 +145,21 @@ if [ -n "$TMUX" ]; then
     # 部署飞书发文件助手（Claude 在 session 内调用，把文件发回飞书群）
     cp "$PROJECT/hooks/feishu_send_file.py" "$HOME/.claude/hooks/feishu_send_file.py" 2>/dev/null || true
     tmux new-session -d -s claude_feishu -c /mnt/d/AI/feishu_workspace \
-        "claude --dangerously-skip-permissions --model $FEISHU_MODEL"
+        "$(claude_cmd_for_model "$FEISHU_MODEL")"
     echo "    tmux session 'claude_feishu' started in /mnt/d/AI/feishu_workspace (model: $FEISHU_MODEL)"
+
+    # 1.7 Start Feishu stock/red Bot.  It has an independent reply route/session,
+    # but AKASHIC_MEM=stock deliberately shares the Telegram stock Bot's memory.
+    if [ -f "$FEISHU_STOCK_CONFIG" ]; then
+        echo "[1.7] Starting tmux session 'claude_feishu_stock' (飞书红Bot)..."
+        tmux kill-session -t claude_feishu_stock 2>/dev/null || true
+        mkdir -p /mnt/d/AI/feishu_stock_workspace
+        tmux new-session -d -s claude_feishu_stock -c /mnt/d/AI/feishu_stock_workspace \
+            "AKASHIC_MEM=stock FEISHU_CONFIG_FILE='$FEISHU_STOCK_CONFIG' FEISHU_CHAT_ID_FILE='$HOME/.claude/feishu_chat_id_stock' $(claude_cmd_for_model "$STOCK_MODEL")"
+        echo "    tmux session 'claude_feishu_stock' started with shared stock memory (model: $STOCK_MODEL)"
+    else
+        echo "    WARNING: $FEISHU_STOCK_CONFIG missing; 飞书红Bot disabled"
+    fi
 
     # 2. Start ngrok tunnel with auto-reconnect / 启动 ngrok 隧道（自动重连）
     # 用 ngrok 而不是 cloudflared/localtunnel: Telegram DNS 对 trycloudflare/loca.lt 不稳定，会拒绝解析
@@ -190,8 +225,24 @@ if [ -n "$TMUX" ]; then
     nohup python3 "$PROJECT/feishu_bridge.py" > /tmp/feishu_bridge.log 2>&1 </dev/null &
     disown
     echo "    Feishu bridge started (log: /tmp/feishu_bridge.log)"
+    if [ -f "$FEISHU_STOCK_CONFIG" ]; then
+        nohup env FEISHU_CONFIG_FILE="$FEISHU_STOCK_CONFIG" \
+            FEISHU_BOT_KEY=feishu_stock FEISHU_MEMORY_BOT=stock \
+            FEISHU_TMUX_SESSION=claude_feishu_stock \
+            FEISHU_WORK_DIR=/mnt/d/AI/feishu_stock_workspace \
+            FEISHU_MODEL_FILE="$HOME/.claude/telegram_model_stock" \
+            FEISHU_THINKING_FILE="$HOME/.claude/telegram_thinking_stock" \
+            FEISHU_PENDING_FILE="$HOME/.claude/telegram_pending_feishu_stock" \
+            FEISHU_CHAT_ID_FILE="$HOME/.claude/feishu_chat_id_stock" \
+            FEISHU_MSG_ID_FILE="$HOME/.claude/feishu_reply_message_id_stock" \
+            python3 "$PROJECT/feishu_bridge.py" > /tmp/feishu_stock_bridge.log 2>&1 </dev/null &
+        FEISHU_STOCK_PID=$!
+        echo "$FEISHU_STOCK_PID" > /tmp/feishu_stock_bridge.pid
+        disown
+        echo "    Feishu stock/red bridge started (log: /tmp/feishu_stock_bridge.log)"
+    fi
 
-    # 5.5 Start Proactive Brain (主动大脑：定时用 claude -p 订阅判断是否主动找用户)
+    # 5.5 Start Proactive Brain (主动大脑：定时用 codex exec / ChatGPT 订阅判断是否主动找用户)
     echo "[6.5] Starting Proactive Brain..."
     pkill -f "proactive.py" 2>/dev/null; sleep 0.3
     nohup python3 "$PROJECT/proactive.py" > /tmp/proactive.out 2>&1 </dev/null &

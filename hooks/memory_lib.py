@@ -21,6 +21,7 @@ RECENT_INJECT_TAIL = 8       # how many recent entries to inject per session
 # 显式 工作区目录 → Bot 映射（与 bridge.py BOT_PROFILES / send-to-telegram.py 一致）
 WORKDIR_BOT = {
     "/mnt/d/cao_stock":           "stock",
+    "/mnt/d/AI/feishu_stock_workspace": "stock",
     "/mnt/d/AI/feishu_workspace": "feishu",
 }
 

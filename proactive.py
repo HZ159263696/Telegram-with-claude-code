@@ -5,9 +5,9 @@
 - **每个 bot 独立的大脑/记忆/配置**：main / stock / feishu 各有自己的记忆目录
   (见 hooks/memory_lib.py) 和各自的主动开关与参数；可以只给某些 bot 开主动。
 - 后台定时循环。对每个"已开启主动"的 bot，每隔它自己的 interval 分钟判断一次：
-  用 headless `claude -p`（**走订阅，不带 API key**）读该 bot 的记忆，判断
+  用 headless `codex exec`（**走 ChatGPT 登录订阅，不带 API key**）读该 bot 的记忆，判断
   "此时此刻是否值得主动联系用户"。要么 SKIP（默认、克制），要么生成一条消息发出去。
-- 与对话模型解耦：无论对话 bot 切到 Claude/DeepSeek/GLM，大脑始终用 Claude 订阅判断。
+- 与对话模型解耦：无论对话 bot 当前选择什么模型，大脑始终用独立配置的 GPT 模型判断。
 - 克制优先：静默时段、两次主动最小间隔、每天上限、用户正忙(pending)时跳过。
 
 配置文件 ~/.claude/proactive_config.json 为 **per-bot 结构**：
@@ -24,7 +24,9 @@ import os
 import sys
 import json
 import time
+import shutil
 import subprocess
+import tempfile
 import urllib.request
 import urllib.error
 
@@ -42,10 +44,19 @@ except Exception:
 LOG          = "/tmp/proactive.log"
 CONFIG_FILE  = os.path.expanduser("~/.claude/proactive_config.json")
 STATE_FILE   = os.path.expanduser("~/.claude/proactive_state.json")
-# 大脑的 headless claude -p 在独立 cwd 跑：避免它的 transcript 写进各 bot 交互 session
-# 的 projects 目录，从而污染 bridge 轮询找的"最新 transcript"。
+# 大脑的 headless codex exec 在独立 cwd 跑，并使用 --ephemeral：
+# 避免生成持久会话或污染 bridge 主对话的 Codex 事件流。
 BRAIN_WORKDIR = os.path.expanduser("~/.claude/proactive_workdir")
 os.makedirs(BRAIN_WORKDIR, exist_ok=True)
+
+CODEX_SUBSCRIPTION_MODEL = "codex-subscription"
+CODEX_MODEL_IDS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+PROACTIVE_GPT_MODELS = (CODEX_SUBSCRIPTION_MODEL,) + CODEX_MODEL_IDS
+_USER_CODEX_EXECUTABLE = os.path.expanduser("~/.local/bin/codex")
+CODEX_EXECUTABLE = os.environ.get(
+    "CODEX_EXECUTABLE",
+    _USER_CODEX_EXECUTABLE if os.path.isfile(_USER_CODEX_EXECUTABLE) else "codex",
+)
 
 FEISHU_APP_ID     = os.environ.get("FEISHU_APP_ID",     "REDACTED_FEISHU_APP_ID")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
@@ -86,9 +97,9 @@ DEFAULT_BOT = {
     "max_per_day":    4,                 # 每天主动上限
     "min_idle_hours": 2,                 # 用户至少安静这么久才考虑主动
     "max_silence_hours": 24,             # 保底：用户超过这么久没联系必主动一次（0=关闭）
-    "brain_model":    "claude-haiku-4-5-20251001",  # 大脑用的模型（快、省额度）
+    "brain_model":    CODEX_SUBSCRIPTION_MODEL,  # 空间账号当前默认 GPT，走订阅额度
     "optimize_enabled": True,            # 是否每天把零散 RECENT 归并进长期记忆
-    "optimize_model":   "",              # 归并用模型（空=用 brain_model；建议 sonnet 更稳）
+    "optimize_model":   "",              # 归并用模型（空=用 brain_model）
 }
 # 每个 bot 默认是否开启主动：默认只有主控 Bot 开，其它需用户在面板手动开
 DEFAULT_ENABLED = {"main": True, "stock": False, "feishu": False}
@@ -138,6 +149,11 @@ def bot_config(raw, name):
     sub = raw.get(name) if isinstance(raw, dict) else None
     if isinstance(sub, dict):
         b.update(sub)
+    # 兼容旧配置：以前保存的 Claude/其它模型自动迁移到 GPT 自动选择。
+    if b.get("brain_model") not in PROACTIVE_GPT_MODELS:
+        b["brain_model"] = CODEX_SUBSCRIPTION_MODEL
+    if b.get("optimize_model") and b["optimize_model"] not in PROACTIVE_GPT_MODELS:
+        b["optimize_model"] = ""
     return b
 
 
@@ -245,7 +261,7 @@ def send_to(b, target, text):
     return tg_send(b["token"], target, text)
 
 
-# ── 大脑：让 Claude 订阅判断要不要主动 + 生成消息 ─────────────────────────────
+# ── 大脑：让 GPT / ChatGPT 订阅判断要不要主动 + 生成消息 ──────────────────────
 
 def build_prompt(mem_bot, now, idle_str, sent_today, last_proactive, force=False):
     weekday = WEEKDAYS[now.tm_wday]
@@ -308,25 +324,52 @@ def build_prompt(mem_bot, now, idle_str, sent_today, last_proactive, force=False
 
 
 def ask_brain(bcfg, prompt, model=None, timeout=150):
-    """调用 headless claude -p（走订阅）。返回 stdout 文本；失败返回空串。"""
-    # 关键：剔除 ANTHROPIC_API_KEY / BASE_URL，强制走订阅而非任何代理/厂商 key
+    """调用 headless codex exec（走 ChatGPT 登录订阅）。失败返回空串。"""
+    selected_model = model or bcfg.get("brain_model") or DEFAULT_BOT["brain_model"]
+    if selected_model not in PROACTIVE_GPT_MODELS:
+        selected_model = CODEX_SUBSCRIPTION_MODEL
+    if not shutil.which(CODEX_EXECUTABLE):
+        log(f"brain 调用失败: 找不到 Codex CLI ({CODEX_EXECUTABLE})")
+        return ""
+
+    # 剔除 API 计费凭据和其它模型代理；保留 Codex 本地 ChatGPT 登录态/
+    # CODEX_ACCESS_TOKEN。codex-subscription 不传 --model，由账号自动选择。
     env = {k: v for k, v in os.environ.items()
-           if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")}
-    cmd = ["claude", "-p", prompt,
-           "--model", model or bcfg.get("brain_model") or DEFAULT_BOT["brain_model"],
-           "--dangerously-skip-permissions"]
+           if k not in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY",
+                        "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")}
+    fd, reply_path = tempfile.mkstemp(prefix="proactive-codex-", suffix=".txt")
+    os.close(fd)
+    cmd = [CODEX_EXECUTABLE, "exec"]
+    if selected_model in CODEX_MODEL_IDS:
+        cmd += ["--model", selected_model]
+    cmd += [
+        "--ephemeral",
+        "--sandbox", "read-only",
+        "--skip-git-repo-check",
+        "--output-last-message", reply_path,
+        "--cd", BRAIN_WORKDIR,
+        prompt,
+    ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, env=env, cwd=BRAIN_WORKDIR)
-    except subprocess.TimeoutExpired:
-        log("brain 超时")
-        return ""
-    except Exception as e:
-        log(f"brain 调用失败: {e}")
-        return ""
-    if r.returncode != 0:
-        log(f"brain 退出码 {r.returncode}: {r.stderr[:200]}")
-    return (r.stdout or "").strip()
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout, env=env, cwd=BRAIN_WORKDIR)
+        except subprocess.TimeoutExpired:
+            log("brain 超时")
+            return ""
+        except Exception as e:
+            log(f"brain 调用失败: {e}")
+            return ""
+        reply = open(reply_path, encoding="utf-8", errors="replace").read().strip()
+        if r.returncode != 0:
+            log(f"brain 退出码 {r.returncode}: {(r.stderr or r.stdout)[:300]}")
+            return ""
+        return reply or (r.stdout or "").strip()
+    finally:
+        try:
+            os.remove(reply_path)
+        except Exception:
+            pass
 
 
 def parse_decision(out):

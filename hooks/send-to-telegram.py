@@ -9,7 +9,7 @@
 3. 指纹去重：每个分段按内容 md5 记账，近 600s 内已发过的不再发
    → 补发/并发都不会重复。
 """
-import sys, os, json, re, time, fcntl, hashlib, urllib.request, urllib.error
+import sys, os, json, re, time, fcntl, hashlib, mimetypes, uuid, urllib.request, urllib.error
 
 # 共享记忆层（best-effort，缺失/出错都不影响回复发送）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,14 +23,36 @@ TOKEN_STATS_FILE = os.path.expanduser("~/.claude/telegram_token_stats.json")
 
 FEISHU_APP_ID     = os.environ.get("FEISHU_APP_ID",     "REDACTED_FEISHU_APP_ID")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
+FEISHU_STOCK_CONFIG = os.environ.get(
+    "FEISHU_STOCK_CONFIG",
+    "/mnt/d/AI/claudecode-telegram-main/.env.feishu_stock",
+)
 
 DEDUP_WINDOW = 600   # 秒：同一分段指纹在此窗口内已发过则跳过
 OUTBOX_TTL   = 86400 # 秒：outbox 条目超过 1 天未发出则丢弃，防无限堆积
+FEISHU_IMAGE_MARKER = re.compile(r"\[\[FEISHU_IMAGE:([^\]\r\n]+)\]\]")
 
 
 def _enc(path):
     """Claude Code 把 cwd 的非字母数字字符转成 '-' 作为 projects 子目录名。"""
     return re.sub(r'[^a-zA-Z0-9]', '-', path)
+
+
+def _load_env_file(path):
+    values = {}
+    try:
+        for raw in open(os.path.expanduser(path), encoding="utf-8"):
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip("'\"")
+    except OSError:
+        pass
+    return values
+
+
+_feishu_stock_config = _load_env_file(FEISHU_STOCK_CONFIG)
 
 
 BOT_ROUTES = [
@@ -42,9 +64,22 @@ BOT_ROUTES = [
         "target":  os.path.expanduser("~/.claude/telegram_chat_id_stock"),
     },
     {
+        "bot":       "feishu_stock",
+        "memory_bot":"stock",
+        "workdir":   "/mnt/d/AI/feishu_stock_workspace",
+        "token":     "feishu",
+        "app_id":    _feishu_stock_config.get("FEISHU_APP_ID", ""),
+        "app_secret":_feishu_stock_config.get("FEISHU_APP_SECRET", ""),
+        "pending":   os.path.expanduser("~/.claude/telegram_pending_feishu_stock"),
+        "target":    os.path.expanduser("~/.claude/feishu_reply_message_id_stock"),
+    },
+    {
         "bot":     "feishu",
+        "memory_bot":"feishu",
         "workdir": "/mnt/d/AI/feishu_workspace",
         "token":   "feishu",
+        "app_id":  FEISHU_APP_ID,
+        "app_secret": FEISHU_APP_SECRET,
         "pending": os.path.expanduser("~/.claude/telegram_pending_feishu"),
         "target":  os.path.expanduser("~/.claude/feishu_reply_message_id"),
     },
@@ -105,8 +140,15 @@ def log(msg):
         f.write(f"{msg}\n")
 
 
-def fp_of(s):
-    return hashlib.md5(s.encode("utf-8", "ignore")).hexdigest()[:16]
+def fp_of(s, salt=""):
+    """Return a delivery fingerprint.
+
+    Raw Codex replies often are just "是" / "不是".  Their text alone is not a
+    safe idempotency key, so the bridge supplies a stable per-turn salt for that
+    path.  Transcript replies keep the legacy content-only fingerprint.
+    """
+    payload = f"{salt}\0{s}" if salt else s
+    return hashlib.md5(payload.encode("utf-8", "ignore")).hexdigest()[:16]
 
 
 # ── 指纹去重账本 ─────────────────────────────────────────────────────────────
@@ -182,8 +224,12 @@ def outbox_add(bot, item):
 
 
 # ── Feishu 回复 ────────────────────────────────────────────────────────────────
-def feishu_get_token() -> str:
-    body = json.dumps({"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).encode()
+def feishu_get_token(route) -> str:
+    app_id = route.get("app_id", FEISHU_APP_ID)
+    app_secret = route.get("app_secret", FEISHU_APP_SECRET)
+    if not app_id or not app_secret:
+        raise RuntimeError(f"missing Feishu credentials for {route['bot']}")
+    body = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
     req = urllib.request.Request(
         "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
         body, {"Content-Type": "application/json"}
@@ -194,10 +240,10 @@ def feishu_get_token() -> str:
     return resp["tenant_access_token"]
 
 
-def feishu_send_one(message_id: str, text: str) -> bool:
+def feishu_send_one(route, message_id: str, text: str) -> bool:
     """回复飞书指定消息（线程内）。单段，调用方负责分段。"""
     try:
-        token = feishu_get_token()
+        token = feishu_get_token(route)
     except Exception as e:
         log(f"feishu get_token failed: {e}")
         return False
@@ -228,6 +274,52 @@ def feishu_send_one(message_id: str, text: str) -> bool:
             time.sleep(min(2 ** attempt, 20))
     log(f"feishu send FAILED: {last_err}")
     return False
+
+
+def feishu_send_image(route, message_id: str, path: str) -> bool:
+    """上传本地图片并回复到触发本轮对话的飞书消息。"""
+    path = os.path.abspath(os.path.expanduser(path.strip()))
+    if not os.path.isfile(path) or os.path.getsize(path) > 10 * 1024 * 1024:
+        log(f"feishu image invalid: {path}")
+        return False
+    try:
+        token = feishu_get_token(route)
+        boundary = "----feishu" + uuid.uuid4().hex
+        filename = os.path.basename(path)
+        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        body = b"".join([
+            (f'--{boundary}\r\nContent-Disposition: form-data; name="image_type"'
+             f'\r\n\r\nmessage\r\n').encode(),
+            (f'--{boundary}\r\nContent-Disposition: form-data; name="image"; '
+             f'filename="{filename}"\r\nContent-Type: {ctype}\r\n\r\n').encode(),
+            open(path, "rb").read(),
+            f"\r\n--{boundary}--\r\n".encode(),
+        ])
+        req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/im/v1/images", body,
+            {"Content-Type": f"multipart/form-data; boundary={boundary}",
+             "Authorization": f"Bearer {token}"},
+        )
+        uploaded = json.loads(urllib.request.urlopen(req, timeout=60).read())
+        if uploaded.get("code") != 0:
+            log(f"feishu image upload failed: {uploaded}")
+            return False
+        reply_body = json.dumps({
+            "content": json.dumps({"image_key": uploaded["data"]["image_key"]}),
+            "msg_type": "image",
+        }).encode()
+        reply_req = urllib.request.Request(
+            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
+            reply_body,
+            {"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        )
+        replied = json.loads(urllib.request.urlopen(reply_req, timeout=30).read())
+        ok = replied.get("code") == 0
+        log(f"feishu image send ok={ok}: {filename}")
+        return ok
+    except Exception as e:
+        log(f"feishu image send failed {path}: {e}")
+        return False
 
 
 # ── Telegram 回复 ──────────────────────────────────────────────────────────────
@@ -279,7 +371,7 @@ def tg_send(token, chat_id, txt, mode=None):
 def deliver_part(route, target, part_text):
     """发送单个分段，返回是否成功。"""
     if route["token"] == "feishu":
-        return feishu_send_one(target, part_text)
+        return feishu_send_one(route, target, part_text)
     ok = tg_send(route["token"], target, md_to_html(part_text), "HTML")
     if not ok:
         log("HTML failed, trying plain text")
@@ -287,22 +379,33 @@ def deliver_part(route, target, part_text):
     return ok
 
 
-def deliver_with_outbox(route, target, parts):
-    """把每个分段过一遍：去重→落 outbox→发送→成功则记账+移除。"""
+def deliver_with_outbox(route, target, parts, salt=""):
+    """把每个分段过一遍：去重→落 outbox→发送→成功则记账+移除。
+
+    Returns True only after every new part has been persisted in the outbox.
+    This lets the caller retain ``pending`` if durable persistence itself fails.
+    """
     bot = route["bot"]
     for part in parts:
-        fp = fp_of(part)
+        fp = fp_of(part, salt)
         if already_sent(bot, fp):
             log(f"dup skip part fp={fp}")
             continue
         item = {"ts": time.time(), "target": target, "text": part, "fp": fp}
-        outbox_add(bot, item)
+        try:
+            # Durably queue before any network attempt.  Never silently discard
+            # a reply just because Telegram or this process is unavailable.
+            outbox_add(bot, item)
+        except Exception as e:
+            log(f"outbox persist failed fp={fp}: {e}")
+            return False
         if deliver_part(route, target, part):
             mark_sent(bot, fp)
             _outbox_drop(bot, fp)
         else:
             log(f"deliver failed, kept in outbox fp={fp}")
         time.sleep(0.4)
+    return True
 
 
 def _outbox_drop(bot, fp):
@@ -354,12 +457,99 @@ def _extract(lines, last_user_idx):
     return "\n\n".join(texts).strip(), ti, to
 
 
+def _route_by_bot(bot):
+    """按显式 bot 名获取路由；供不产生 Claude transcript 的执行器复用发送层。"""
+    return next((r for r in BOT_ROUTES if r["bot"] == bot), None)
+
+
+def _send_raw_reply(data):
+    """发送非 Claude transcript 的最终回复（当前用于 Codex CLI 订阅模式）。"""
+    route = _route_by_bot(data.get("bot", ""))
+    text = str(data.get("reply_text", "")).strip()
+    image_paths = []
+    if route and route.get("token") == "feishu":
+        image_paths = [m.group(1).strip() for m in FEISHU_IMAGE_MARKER.finditer(text)]
+        text = FEISHU_IMAGE_MARKER.sub("", text).strip()
+    if not route or not text:
+        log("raw reply missing bot or text, skip")
+        return
+
+    pending = route["pending"]
+    target_file = route["target"]
+    if not os.path.exists(pending):
+        log(f"raw reply no pending for {route['bot']}, skip")
+        return
+    try:
+        if time.time() - int(open(pending).read().strip()) > 1800:
+            os.remove(pending)
+            log(f"raw reply pending expired for {route['bot']}")
+            return
+    except Exception:
+        try: os.remove(pending)
+        except Exception: pass
+        return
+    if not os.path.exists(target_file):
+        log(f"raw reply missing target for {route['bot']}")
+        try: os.remove(pending)
+        except Exception: pass
+        return
+
+    lock_fd = open(os.path.expanduser(f"~/.claude/hook_lock_{route['bot']}"), "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        log(f"raw reply lock busy for {route['bot']}")
+        return
+    delivery_queued = False
+    try:
+        outbox_flush(route)
+        # Codex 直发路径没有 transcript 的 last_user_idx 可用。必须带上 bridge
+        # 为本轮生成的 delivery_salt；否则连续的“是/不是”等短回复会被 10 分钟
+        # 指纹去重窗口误判为旧消息，从而根本不发送。
+        delivery_salt = str(data.get("delivery_salt", ""))
+        delivery_queued = deliver_with_outbox(
+            route,
+            open(target_file).read().strip(),
+            build_parts(route["token"], text),
+            salt=delivery_salt,
+        )
+        if not delivery_queued:
+            log(f"raw reply kept pending after outbox persist failure for {route['bot']}")
+            return
+        target = open(target_file).read().strip()
+        for image_path in image_paths:
+            feishu_send_image(route, target, image_path)
+        if memory_lib is not None:
+            try:
+                memory_lib.append_recent(route.get("memory_bot", route["bot"]),
+                                         str(data.get("user_text", "")), text)
+            except Exception as e:
+                log(f"raw reply memory error: {e}")
+        log(f"raw reply delivered for {route['bot']}: len={len(text)}")
+    except Exception as e:
+        log(f"raw reply send error: {e}")
+    finally:
+        # Do not remove the recovery marker until the reply is either delivered
+        # or safely persisted in the outbox.  An unexpected local I/O failure
+        # must remain visible and retryable instead of becoming a silent loss.
+        if delivery_queued and os.path.exists(pending):
+            try: os.remove(pending)
+            except Exception: pass
+        try: lock_fd.close()
+        except Exception: pass
+
+
 def main():
     raw = sys.stdin.read()
     try:
         data = json.loads(raw)
     except:
         log(f"bad json input: {raw[:200]}")
+        return
+
+    # Codex CLI 等非 Claude 执行器直接提供最终文本，不需要 transcript/Stop hook。
+    if "reply_text" in data:
+        _send_raw_reply(data)
         return
 
     transcript_path = data.get("transcript_path", "")
@@ -505,8 +695,9 @@ def main():
     # ── 写记忆（best-effort）───────────────────────────────────────────────────
     if memory_lib is not None:
         try:
-            memory_lib.append_recent(BOT_KEY, human_user_text, assistant_raw)
-            log(f"memory appended: bot={BOT_KEY}")
+            memory_key = route.get("memory_bot", BOT_KEY)
+            memory_lib.append_recent(memory_key, human_user_text, assistant_raw)
+            log(f"memory appended: bot={memory_key} route={BOT_KEY}")
         except Exception as e:
             log(f"memory write error: {e}")
 

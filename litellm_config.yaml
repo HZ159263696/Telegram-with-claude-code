@@ -22,12 +22,6 @@ model_list:
       api_base: https://open.bigmodel.cn/api/paas/v4
       api_key: REDACTED_API_KEY
 
-  - model_name: abab6.5s-chat
-    litellm_params:
-      model: openai/abab6.5s-chat
-      api_base: https://api.minimax.chat/v1
-      api_key: REDACTED_API_KEY
-
   - model_name: qwen-max
     litellm_params:
       model: openai/qwen-max
@@ -68,13 +62,6 @@ model_list:
     litellm_params:
       model: openai/glm-4-flash
       api_base: https://open.bigmodel.cn/api/paas/v4
-      api_key: REDACTED_API_KEY
-
-  # abab6.5s-chat → claude-3-5-haiku-20241022
-  - model_name: claude-3-5-haiku-20241022
-    litellm_params:
-      model: openai/abab6.5s-chat
-      api_base: https://api.minimax.chat/v1
       api_key: REDACTED_API_KEY
 
   # qwen-max → claude-3-5-sonnet-latest
