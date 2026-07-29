@@ -3,9 +3,11 @@ __pycache__/
 .venv/
 *.egg-info/
 .env
+.env.feishu_stock
 build/
 dist/
 *.exe
 *.pkg
 .playwright-mcp/
+.cache/
 uv.lock
