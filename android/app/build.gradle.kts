@@ -11,8 +11,8 @@ android {
         applicationId = "com.claudebridge.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 30
+        versionName = "3.0"
     }
 
     buildTypes {

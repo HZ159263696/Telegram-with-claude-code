@@ -10,4 +10,6 @@ dist/
 *.pkg
 .playwright-mcp/
 .cache/
+.gradle-android-build/
+android/.gradle/
 uv.lock

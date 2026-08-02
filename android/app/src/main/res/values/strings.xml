@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Claude Bridge</string>
+    <string name="app_name">AI Bridge 3.0</string>
     <string name="settings_title">连接设置</string>
     <string name="settings_label_url">控制面板地址</string>
     <string name="settings_hint_url">http://192.168.x.x:8888 或 https://xxx.ngrok-free.app</string>

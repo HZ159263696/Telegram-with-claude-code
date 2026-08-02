@@ -1,4 +1,4 @@
-"""Claude Bridge Desktop App — PyQt6 + WebEngine wrapper for dashboard.py"""
+"""AI Bridge 3.0 Desktop — PyQt6 + WebEngine wrapper for dashboard.py."""
 
 import sys
 import os
@@ -20,6 +20,8 @@ DASHBOARD_URL = "http://localhost:8888"
 WSL_DISTRO = "Ubuntu"
 START_SCRIPT = "/mnt/d/AI/claudecode-telegram-main/windows/start.sh"
 MAX_WAIT_SECONDS = 30
+APP_NAME = "AI Bridge"
+APP_VERSION = "3.0"
 
 # Icon paths (relative to script dir)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +35,15 @@ class StatusSignal(QObject):
     log = pyqtSignal(str)
 
 
+def _dashboard_ready() -> bool:
+    """Return True when the local dashboard is already accepting requests."""
+    try:
+        with urlopen(DASHBOARD_URL, timeout=2) as response:
+            return response.status == 200
+    except (URLError, OSError):
+        return False
+
+
 def _create_icon():
     """Load app icon from icon.ico file."""
     if os.path.exists(_ICON_ICO):
@@ -42,18 +53,24 @@ def _create_icon():
     pix.fill(QColor(0, 0, 0, 0))
     p = QPainter(pix)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setBrush(QColor(0, 212, 255))
+    p.setBrush(QColor(101, 230, 209))
     p.setPen(Qt.PenStyle.NoPen)
     p.drawEllipse(2, 2, 60, 60)
-    p.setPen(QColor(8, 13, 24))
+    p.setPen(QColor(7, 17, 15))
     p.setFont(QFont("Arial", 22, QFont.Weight.Bold))
-    p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "CB")
+    p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "AI")
     p.end()
     return QIcon(pix)
 
 
 def _wait_for_dashboard(signal: StatusSignal):
     """Background thread: launch WSL services, then poll dashboard until ready."""
+    signal.log.emit("Checking local dashboard...")
+    if _dashboard_ready():
+        signal.log.emit("Dashboard is already running.")
+        signal.ready.emit()
+        return
+
     signal.log.emit("Starting WSL services...")
 
     # Launch start.sh inside WSL
@@ -86,14 +103,10 @@ def _wait_for_dashboard(signal: StatusSignal):
     signal.log.emit("Waiting for dashboard to be ready...")
     for i in range(MAX_WAIT_SECONDS):
         time.sleep(1)
-        try:
-            resp = urlopen(DASHBOARD_URL, timeout=2)
-            if resp.status == 200:
-                signal.log.emit("Dashboard is ready!")
-                signal.ready.emit()
-                return
-        except (URLError, OSError):
-            pass
+        if _dashboard_ready():
+            signal.log.emit("Dashboard is ready!")
+            signal.ready.emit()
+            return
 
     signal.failed.emit(f"Dashboard did not respond within {MAX_WAIT_SECONDS}s.\nCheck WSL and start.sh logs.")
 
@@ -132,12 +145,12 @@ class PulsingDot(QWidget):
 
 
 class SplashWidget(QWidget):
-    """Modern loading screen with Claude avatar and animated dots."""
+    """Modern loading screen matching the AI Bridge 3.0 dashboard."""
 
     def __init__(self):
         super().__init__()
         self.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
-                           "stop:0 #f5f0eb, stop:0.5 #ece4dd, stop:1 #e8ddd4);")
+                           "stop:0 #111516, stop:0.55 #0d1112, stop:1 #090c0d);")
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -155,18 +168,18 @@ class SplashWidget(QWidget):
         avatar_label.setStyleSheet("background: transparent; margin-bottom: 8px;")
 
         # Title
-        title = QLabel("Claude Bridge")
+        title = QLabel(APP_NAME)
         title.setStyleSheet(
-            "color: #5b4a8a; font-size: 32px; font-weight: bold; "
+            "color: #e6ecea; font-size: 32px; font-weight: bold; "
             "font-family: 'Segoe UI', 'SF Pro Display', Arial; "
             "background: transparent; letter-spacing: 1px;"
         )
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         # Subtitle
-        subtitle = QLabel("thinking about thinking...")
+        subtitle = QLabel("connecting your local intelligence...")
         subtitle.setStyleSheet(
-            "color: #9584b8; font-size: 14px; font-style: italic; "
+            "color: #778382; font-size: 14px; "
             "font-family: 'Segoe UI', Arial; background: transparent;"
         )
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -179,26 +192,26 @@ class SplashWidget(QWidget):
         dots_layout.setSpacing(8)
         self._dots = []
         for i in range(4):
-            dot = PulsingDot(color="#8b6fc0", size=10, parent=dots_container)
+            dot = PulsingDot(color="#65e6d1", size=10, parent=dots_container)
             dots_layout.addWidget(dot)
             self._dots.append(dot)
 
         # Status text
         self.status = QLabel("Initializing...")
         self.status.setStyleSheet(
-            "color: #7a6b94; font-size: 13px; "
+            "color: #acb7b5; font-size: 13px; "
             "font-family: 'Cascadia Code', 'Consolas', monospace; "
             "background: transparent; padding: 8px 16px; "
-            "border: 1px solid #d4c8e6; border-radius: 8px;"
+            "border: 1px solid #283032; border-radius: 8px;"
         )
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status.setWordWrap(True)
         self.status.setMaximumWidth(400)
 
         # Version / footer
-        footer = QLabel("v2.0 — Claude, 2026")
+        footer = QLabel(f"VERSION {APP_VERSION} · LOCAL INTELLIGENCE CONSOLE")
         footer.setStyleSheet(
-            "color: #b8a8cc; font-size: 11px; font-family: 'Segoe UI', Arial; "
+            "color: #65706f; font-size: 11px; font-family: 'Cascadia Code', 'Consolas', monospace; "
             "background: transparent;"
         )
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -231,14 +244,17 @@ class SplashWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Claude Bridge 2.0")
-        self.setFixedSize(520, 900)
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.setWindowIcon(_create_icon())
 
-        # Center on screen
-        screen = QApplication.primaryScreen().geometry()
-        x = (screen.width() - 520) // 2
-        y = (screen.height() - 900) // 2
+        # Use the desktop layout when space permits, while remaining usable on smaller screens.
+        screen = QApplication.primaryScreen().availableGeometry()
+        width = min(1240, max(760, int(screen.width() * 0.82)))
+        height = min(920, max(640, int(screen.height() * 0.88)))
+        self.resize(width, height)
+        self.setMinimumSize(760, 640)
+        x = screen.x() + (screen.width() - width) // 2
+        y = screen.y() + (screen.height() - height) // 2
         self.move(x, y)
 
         # Splash (loading screen)
@@ -277,7 +293,7 @@ class MainWindow(QMainWindow):
 
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_clicked)
-        self.tray.setToolTip("Claude Bridge")
+        self.tray.setToolTip(f"{APP_NAME} {APP_VERSION}")
         self.tray.show()
 
     def _on_ready(self):
@@ -305,8 +321,8 @@ class MainWindow(QMainWindow):
         event.ignore()
         self.hide()
         self.tray.showMessage(
-            "Claude Bridge",
-            "Minimized to tray. Right-click tray icon to quit.",
+            APP_NAME,
+            "已最小化到系统托盘，右键托盘图标可退出。",
             QSystemTrayIcon.MessageIcon.Information,
             2000,
         )

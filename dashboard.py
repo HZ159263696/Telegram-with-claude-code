@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Bridge Dashboard — Visual control console at http://localhost:9999"""
+"""AI Bridge 3.0 Dashboard — visual control console at http://localhost:8888."""
 
 import os
 import sys
@@ -9,6 +9,7 @@ import time
 import queue
 import threading
 import subprocess
+from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
@@ -460,12 +461,12 @@ def _relaunch_claude(model, bot_key="main", thinking=None):
 _bridge_proc       = None
 _bridge_start_time = None
 # 每个 Bot 独立的缓冲、序号、SSE 队列
-_log_buffers = {k: [] for k in BOTS}    # bot_key -> list of (seq, text)
+MAX_LOG_LINES = 500
+_log_buffers = {k: deque(maxlen=MAX_LOG_LINES) for k in BOTS}
 _log_seqs    = {k: 0  for k in BOTS}
 _log_lock    = threading.Lock()
 _sse_queues  = {k: [] for k in BOTS}    # bot_key -> list of queue.Queue
 _sse_lock    = threading.Lock()
-MAX_LOG_LINES = 500
 
 
 def _push_log(bot_key, text):
@@ -475,8 +476,6 @@ def _push_log(bot_key, text):
     with _log_lock:
         _log_seqs[bot_key] += 1
         _log_buffers[bot_key].append((_log_seqs[bot_key], text))
-        if len(_log_buffers[bot_key]) > MAX_LOG_LINES:
-            _log_buffers[bot_key].pop(0)
     with _sse_lock:
         for q in list(_sse_queues[bot_key]):
             try:
@@ -501,8 +500,8 @@ def _log(line, bot_key=None):
 def _read_bridge_output(proc):
     """Bridge 子进程的 stdout 同时给两个 Bot 看 — 因为 webhook 路由日志、错误等都是全局的。
     但单条 `[主控Bot][...]` / `[股票Bot][...]` 行会被路由到对应 Bot。"""
-    for raw in iter(proc.stdout.readline, b""):
-        line = raw.decode(errors="replace").rstrip()
+    for raw in iter(proc.stdout.readline, ""):
+        line = raw.rstrip()
         if not line:
             continue
         # bridge.py 打印 "[主控Bot][chat_id] ..." 这种行，根据前缀路由
@@ -1014,6 +1013,7 @@ def start_bridge():
         [sys.executable, BRIDGE_SCRIPT],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         env=env, close_fds=True, bufsize=1,
+        text=True, encoding="utf-8", errors="replace",
     )
     _bridge_start_time = time.time()
     threading.Thread(target=_read_bridge_output, args=(_bridge_proc,), daemon=True).start()
@@ -1145,9 +1145,10 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Claude Bridge 控制台</title>
+<title>AI Bridge 3.0</title>
+<meta name="description" content="AI Bridge 3.0 本地模型桥接控制台">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Syne:wght@600;700&display=swap" rel="stylesheet">
 <style>
 :root{
   --bg:#080d18;
@@ -1475,10 +1476,14 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
   background:var(--surface);
   border:1px solid var(--border);border-bottom:none;
   border-radius:20px 20px 0 0;
-  z-index:101;transition:transform .35s cubic-bezier(.32,1,.25,1);
+  z-index:101;visibility:hidden;
+  transition:transform .35s cubic-bezier(.32,1,.25,1),visibility 0s linear .35s;
   max-height:82vh;display:flex;flex-direction:column;
 }
-.sheet.open{transform:translateX(-50%) translateY(0)}
+.sheet.open{
+  visibility:visible;transform:translateX(-50%) translateY(0);
+  transition-delay:0s;
+}
 .sheet-handle{
   width:36px;height:4px;border-radius:2px;
   background:var(--border);margin:12px auto 0;flex-shrink:0;
@@ -1591,16 +1596,302 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
   white-space:nowrap;
 }
 .toast.show{opacity:1}
+
+/* ── AI Bridge 3.0: compact operations console ── */
+:root{
+  --bg:#090c0d;
+  --surface:#111516;
+  --surface2:#181d1e;
+  --border:#283032;
+  --accent:#65e6d1;
+  --accent2:#2fc7b2;
+  --green:#65e6a8;
+  --red:#ff6b6b;
+  --text:#e6ecea;
+  --text2:#778382;
+  --text3:#acb7b5;
+  --font-ui:'IBM Plex Sans','Microsoft YaHei',sans-serif;
+}
+body{
+  display:block;
+  padding:30px 22px 48px;
+  font-family:var(--font-ui);
+  background:
+    radial-gradient(900px 520px at 78% -10%,rgba(101,230,209,.07),transparent 68%),
+    var(--bg);
+}
+body::before{
+  background-image:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px);
+  background-size:100% 48px;
+}
+body::after{display:none}
+.app-shell{width:min(1160px,100%);margin:0 auto}
+.header{
+  max-width:none;
+  margin:0 0 22px;
+  min-height:48px;
+  justify-content:space-between;
+}
+.brand-lockup{display:flex;align-items:center;gap:12px}
+.brand-mark{
+  width:42px;height:42px;border-radius:13px;
+  display:grid;place-items:center;
+  color:#07110f;background:var(--accent);
+  font:700 13px/1 var(--font-display);
+  letter-spacing:-.4px;
+  box-shadow:0 10px 30px rgba(101,230,209,.14);
+}
+.header-kicker{
+  color:var(--text2);font:500 9px/1.2 var(--font-mono);
+  letter-spacing:1.55px;margin-bottom:5px;
+}
+.header h1{
+  font-size:21px;line-height:1;letter-spacing:-.3px;
+  text-transform:none;
+}
+.header-ver{
+  color:var(--accent);border-color:rgba(101,230,209,.24);
+  background:rgba(101,230,209,.06);
+  padding:5px 10px;border-radius:999px;
+  font:600 10px/1 var(--font-mono);
+}
+.header-ver::before{content:'VERSION ';color:var(--text2);font-weight:400}
+.dashboard-grid{
+  display:grid;
+  grid-template-columns:minmax(310px,380px) minmax(0,1fr);
+  gap:18px;align-items:stretch;
+}
+.control-column,.activity-column{min-width:0}
+.control-column{display:flex;flex-direction:column;gap:12px}
+.bot-tabs{
+  max-width:none;margin:0;padding:4px;
+  border-radius:13px;background:rgba(17,21,22,.88);
+}
+.bot-tab{
+  min-height:38px;border-radius:9px;
+  font-family:var(--font-ui);font-size:12px;letter-spacing:0;
+}
+.bot-tab.active{
+  color:var(--text);background:var(--surface2);
+  box-shadow:inset 0 0 0 1px rgba(101,230,209,.18);
+}
+.bot-tab.active .bot-tab-dot{background:var(--accent);box-shadow:0 0 8px rgba(101,230,209,.45)}
+.control-card{
+  padding:18px;border:1px solid var(--border);border-radius:16px;
+  background:var(--surface);
+}
+.power-wrap{
+  display:grid;grid-template-columns:66px minmax(0,1fr);
+  gap:14px;align-items:center;margin:0 0 16px;
+}
+.power-ring{
+  width:64px;height:64px;border-color:var(--border);
+}
+.power-ring::before{inset:-4px;background:none;border-color:rgba(101,230,209,.12)}
+.power-btn{width:48px;height:48px;background:var(--surface2)}
+.power-icon{width:22px;height:22px}
+.power-btn.running{
+  background:rgba(101,230,168,.09);
+  box-shadow:0 0 0 1px rgba(101,230,168,.32),0 0 22px rgba(101,230,168,.1);
+}
+.power-btn.running::after{display:none}
+.status-row{
+  margin:0;align-items:flex-start;flex-direction:column;gap:5px;
+  font:500 11px/1.45 var(--font-mono);color:var(--text2);
+}
+.status-row::before{
+  content:'BRIDGE STATUS';font:500 9px/1 var(--font-mono);
+  color:var(--text2);letter-spacing:1px;
+}
+.status-row .status-dot{position:absolute;right:0;top:1px}
+.status-row.running{color:var(--green)}
+.model-trigger{
+  max-width:none;margin:0;padding:14px 0 0;
+  border:0;border-top:1px solid var(--border);border-radius:0;
+  background:transparent;
+}
+.model-trigger:hover{background:transparent;border-color:var(--border)}
+.model-trigger-label{font-family:var(--font-mono);letter-spacing:1px}
+.model-trigger-name{font-family:var(--font-ui);font-size:15px}
+.model-trigger-prov{color:var(--accent);font-family:var(--font-mono);font-size:10px}
+.cards{
+  max-width:none;margin:0;grid-template-columns:repeat(2,1fr);gap:10px;
+}
+.card{
+  min-height:78px;text-align:left;padding:13px 14px;border-radius:13px;
+  display:grid;grid-template-columns:auto 1fr;column-gap:9px;align-content:center;
+  background:rgba(17,21,22,.88);
+}
+.card-icon{grid-row:1 / span 2;margin:0;font-size:15px}
+.card-value{font-size:13px;line-height:1.2}
+.card-label{font-size:9px;margin-top:4px;text-transform:uppercase;letter-spacing:.7px}
+.log-panel{
+  max-width:none;width:100%;height:100%;min-height:590px;margin:0;padding:0;
+  border-radius:16px;overflow:hidden;display:flex;flex-direction:column;
+  background:var(--surface);
+}
+.log-header{
+  min-height:58px;margin:0;padding:0 18px;border-bottom:1px solid var(--border);
+}
+.log-title{color:var(--text);font-family:var(--font-ui);font-size:13px;letter-spacing:0;text-transform:none}
+.log-title::after{
+  content:'LIVE';font:600 8px/1 var(--font-mono);letter-spacing:1px;
+  color:var(--accent);border:1px solid rgba(101,230,209,.2);
+  border-radius:999px;padding:3px 6px;
+}
+.log-title-dot{background:var(--accent);box-shadow:0 0 8px rgba(101,230,209,.55)}
+.log-btn{font-family:var(--font-ui);font-size:10px;padding:5px 9px;border-radius:7px}
+#log-output{
+  flex:1;height:auto;min-height:0;overflow-y:auto;padding:16px 18px 20px;
+  color:var(--text3);font:400 11px/1.65 var(--font-mono);
+  scroll-behavior:auto;
+}
+#log-output .ll{color:var(--text2)}
+.run-turn{
+  border:1px solid var(--border);border-radius:13px;
+  background:#0d1112;margin:0 0 12px;overflow:hidden;
+}
+.turn-head{
+  display:flex;align-items:center;gap:8px;
+  padding:9px 12px;border-bottom:1px solid rgba(40,48,50,.7);
+  color:var(--text2);font-size:9px;letter-spacing:.7px;text-transform:uppercase;
+}
+.turn-head .turn-mark{
+  width:19px;height:19px;border-radius:6px;display:grid;place-items:center;
+  color:#07110f;background:var(--accent);font-size:8px;font-weight:700;
+}
+.turn-head .turn-time{margin-left:auto;font-variant-numeric:tabular-nums}
+.turn-body{padding:10px 12px 12px}
+#log-output .run-turn .cl-text{
+  color:var(--text);font:400 13px/1.72 var(--font-ui);
+  white-space:pre-wrap;margin:0;padding:2px 1px;
+}
+#log-output .run-turn .cl-text + .cl-text{margin-top:8px}
+#log-output .run-turn .cl-dot{display:none}
+.run-trace{
+  max-width:none;margin:0 0 10px;border:1px solid rgba(40,48,50,.75);
+  border-radius:9px;background:rgba(24,29,30,.48);overflow:hidden;
+}
+.run-trace > summary{
+  min-height:35px;padding:7px 10px;border:0;border-radius:0;background:transparent;
+  color:var(--text3);font:500 10px/1.4 var(--font-ui);
+  letter-spacing:0;text-transform:none;
+}
+.run-trace > summary::before{content:'›';color:var(--accent);font:600 15px/1 var(--font-mono);transition:transform .16s}
+.run-trace[open] > summary::before{transform:rotate(90deg)}
+.run-trace > summary:hover{border:0;background:rgba(101,230,209,.035)}
+.trace-meta{margin-left:auto;color:var(--text2);font:400 9px/1 var(--font-mono)}
+.trace-body{border-top:1px solid rgba(40,48,50,.65);padding:4px 10px 8px}
+.trace-step{padding:7px 0;border-bottom:1px solid rgba(40,48,50,.45)}
+.trace-step:last-child{border-bottom:0}
+.trace-main{display:flex;gap:7px;color:#bac5c3;word-break:break-word}
+.trace-icon{color:var(--accent);flex:0 0 auto}
+.trace-result{
+  margin:4px 0 0 17px;color:#687573;white-space:pre-wrap;
+  max-height:92px;overflow:auto;word-break:break-word;
+}
+.trace-thinking{color:#8c9795;font-style:italic;white-space:pre-wrap}
+.system-trace{
+  max-width:none;margin:0 0 12px;border:0;border-radius:10px;background:rgba(24,29,30,.34);
+}
+.system-trace > summary{
+  padding:8px 10px;border:0;background:transparent;border-radius:10px;
+  color:var(--text2);font:500 10px/1.4 var(--font-ui);letter-spacing:0;text-transform:none;
+}
+.system-trace > summary::before{content:'○';color:#55615f}
+.system-trace[open] > summary::before{content:'●';color:var(--accent)}
+.system-body{padding:0 10px 9px}
+.system-line{color:#5f6c6a;padding:2px 0;word-break:break-word}
+.system-line.alert{color:#ff9b9b}
+#cl-live{
+  margin:0;padding:10px 18px;border-top:1px solid var(--border);
+  background:rgba(101,230,209,.025);
+}
+#cl-live .cl-spin{color:var(--accent)}
+#cl-live .cl-live-txt{
+  background:linear-gradient(90deg,#6d7977 25%,#dbe6e3 50%,#6d7977 75%);
+  background-size:200% 100%;-webkit-background-clip:text;background-clip:text;
+}
+.settings-section{margin-top:18px}
+.section-heading{
+  display:flex;align-items:baseline;justify-content:space-between;
+  margin:0 2px 10px;color:var(--text);font-size:13px;font-weight:600;
+}
+.section-heading small{color:var(--text2);font-size:10px;font-weight:400}
+.settings-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;align-items:start}
+.settings-grid > details{max-width:none}
+.settings-grid > details > summary{
+  min-height:48px;padding:12px 14px;border-radius:12px;
+  color:var(--text3);font-family:var(--font-ui);letter-spacing:0;text-transform:none;
+}
+.settings-grid > details[open]{grid-column:1 / -1}
+.settings-grid > details[open] summary{border-radius:12px 12px 0 0}
+.keys-body{border-radius:0 0 12px 12px}
+.kr input,.kr select,#m-text{
+  background:#0c1011!important;border-color:var(--border)!important;color:var(--text)!important;
+  font-family:var(--font-ui)!important;
+}
+.save-btn{background:var(--accent);color:#07110f;border-radius:8px;font-family:var(--font-ui)}
+.sheet{max-width:620px;background:var(--surface);border-radius:18px 18px 0 0}
+.model-item.selected{background:rgba(101,230,209,.05);border-left-color:var(--accent)}
+.model-item.selected .model-name{color:var(--accent)}
+.model-item.selected .model-radio{border-color:var(--accent);background:rgba(101,230,209,.12)}
+.model-radio-dot{background:var(--accent);box-shadow:none}
+.log-panel.fullscreen{background:var(--bg);padding:0}
+.log-panel.fullscreen .log-header{padding:0 20px}
+.log-panel.fullscreen #log-output{padding:18px 20px;font-size:12px}
+
+@media (max-width:900px){
+  body{padding-top:22px}
+  .app-shell{width:min(680px,100%)}
+  .dashboard-grid{grid-template-columns:1fr}
+  .log-panel{min-height:520px}
+  .settings-grid{grid-template-columns:1fr}
+  .settings-grid > details[open]{grid-column:auto}
+}
+@media (max-width:560px){
+  body{padding:16px 12px 30px}
+  .header{margin-bottom:16px}
+  .header-kicker{display:none}
+  .header h1{font-size:19px}
+  .brand-mark{width:36px;height:36px;border-radius:11px}
+  .header-ver::before{display:none}
+  .dashboard-grid{gap:12px}
+  .bot-tab{padding:7px 5px;font-size:11px}
+  .control-card{padding:14px}
+  .cards{gap:8px}
+  .card{min-height:70px;padding:11px}
+  .log-panel{min-height:460px;border-radius:14px}
+  .log-header{padding:0 12px}
+  .log-btns{gap:4px}
+  .log-btn{padding:5px 7px}
+  #log-output{padding:12px}
+  .section-heading small{display:none}
+  .kr{align-items:flex-start;flex-wrap:wrap}
+  .kr label{width:100%}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
+}
 </style>
 </head>
 <body>
+<main class="app-shell">
 
 <!-- Header -->
 <div class="header">
-  <div class="header-dot"></div>
-  <h1>Claude Bridge</h1>
-  <div class="header-ver">v2.0</div>
+  <div class="brand-lockup">
+    <div class="brand-mark">AI</div>
+    <div>
+      <div class="header-kicker">LOCAL INTELLIGENCE CONSOLE</div>
+      <h1>AI Bridge</h1>
+    </div>
+  </div>
+  <div class="header-ver">3.0</div>
 </div>
+
+<div class="dashboard-grid">
+<section class="control-column" aria-label="服务控制">
 
 <!-- Bot Switcher -->
 <div class="bot-tabs" id="botTabs">
@@ -1615,6 +1906,7 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
   </button>
 </div>
 
+<div class="control-card">
 <!-- Power Button -->
 <div class="power-wrap">
   <div class="power-ring">
@@ -1640,6 +1932,7 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
   </div>
   <div class="model-trigger-arrow" id="triggerArrow">▾</div>
 </div>
+</div>
 
 <!-- Stats Cards -->
 <div class="cards">
@@ -1664,7 +1957,9 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
     <div class="card-label">Webhook</div>
   </div>
 </div>
+</section>
 
+<section class="activity-column" aria-label="实时活动">
 <!-- Log Panel -->
 <div class="log-panel">
   <div class="log-header">
@@ -1681,7 +1976,15 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
   <div id="log-output"></div>
   <div id="cl-live"><span class="cl-spin">✶</span><span class="cl-live-txt" id="clLiveTxt">思考中…</span><span class="cl-live-sec" id="clLiveSec"></span></div>
 </div>
+</section>
+</div>
 
+<section class="settings-section" aria-label="高级设置">
+  <div class="section-heading">
+    <span>配置与记忆</span>
+    <small>按需展开，日常运行无需操作</small>
+  </div>
+  <div class="settings-grid">
 <!-- API Keys -->
 <details>
   <summary>
@@ -1754,6 +2057,9 @@ details[open] summary{border-radius:10px 10px 0 0;border-bottom-color:transparen
     <button class="save-btn" onclick="saveMemory()">保存到当前 Bot 记忆</button>
   </div>
 </details>
+</div>
+</section>
+</main>
 
 <!-- Model Picker Sheet -->
 <div class="sheet-overlay" id="sheetOverlay" onclick="closeSheet()"></div>
@@ -1808,7 +2114,7 @@ function switchBot(bot){
     el.classList.toggle("active",el.dataset.bot===bot);
   });
   // 清空当前日志，快照先行立即显示新 Bot 内容，实时流静默接上（永不弹窗）
-  document.getElementById("log-output").innerHTML="";
+  clearLog();
   _liveEvtTs=0;setClaudeLive(false);   // 动效随旧 Bot 清掉，新 Bot 状态由 fetchStatus 决定
   connectLogs();
   fetchStatus();
@@ -2112,32 +2418,142 @@ function _evtFresh(ts){
   if(d>43200)d=86400-d;   // 跨午夜
   return d<=15;
 }
-function _renderClaudeEvt(jsonStr,first){
-  let e;try{e=JSON.parse(jsonStr);}catch(err){return null;}
-  if(_evtFresh(e.ts))_liveOnEvt(e.k);   // 实时事件 = Claude 正在干活，点亮思考动效
-  const d=document.createElement("div");
-  const base="ll"+(first?"":" new");
-  if(e.k==="think"){
-    d.className=base+" cl-think";
-    const prev=_esc(((e.t||"").split("\n")[0]||"").slice(0,40));
-    d.innerHTML='<details><summary>✻ 思考过程 <span class="cl-ts">'+_esc(e.ts||"")+' · '+(e.t||"").length+'字</span><span class="cl-think-prev">'+prev+'…</span></summary><div class="cl-think-body">'+_esc(e.t)+'</div></details>';
-  }else if(e.k==="text"){
-    d.className=base+" cl-text";
-    d.innerHTML='<span class="cl-dot">●</span>'+_esc(e.t);
-  }else if(e.k==="tool"){
-    d.className=base+" cl-tool";
-    const t=e.t||"",i=t.indexOf("(");
-    if(i>0)d.innerHTML='⏺ <span class="cl-tool-name">'+_esc(t.slice(0,i))+'</span><span class="cl-tool-arg">'+_esc(t.slice(i))+'</span>';
-    else d.textContent="⏺ "+t;
-  }else if(e.k==="result"){
-    d.className=base+" cl-result";
-    d.textContent="⎿ "+e.t;
-    d.title="点击展开/收起";
-    d.onclick=()=>d.classList.toggle("open");
+let _activeTurn=null,_activeTrace=null,_lastTraceStep=null,_systemTrace=null,_turnSeq=0;
+
+function _resetLogGroups(){
+  _activeTurn=null;_activeTrace=null;_lastTraceStep=null;_systemTrace=null;_turnSeq=0;
+}
+function _tsSeconds(ts){
+  const p=String(ts||"").split(":").map(Number);
+  return p.length===3&&p.every(Number.isFinite)?p[0]*3600+p[1]*60+p[2]:0;
+}
+function _newTurn(logEl,e,first){
+  const turn=document.createElement("article");
+  turn.className="run-turn"+(first?"":" new");
+  turn.dataset.hasReply="0";
+  turn.dataset.lastSec=String(_tsSeconds(e.ts));
+  const head=document.createElement("div");
+  head.className="turn-head";
+  const mark=document.createElement("span");
+  mark.className="turn-mark";mark.textContent="AI";
+  const label=document.createElement("span");
+  label.textContent="运行回合 "+String(++_turnSeq).padStart(2,"0");
+  const time=document.createElement("span");
+  time.className="turn-time";time.textContent=e.ts||"";
+  head.append(mark,label,time);
+  const body=document.createElement("div");
+  body.className="turn-body";
+  turn.append(head,body);
+  logEl.appendChild(turn);
+  _activeTurn=turn;_activeTrace=null;_lastTraceStep=null;_systemTrace=null;
+  return turn;
+}
+function _turnForEvent(logEl,e,first){
+  if(_activeTurn&&!_activeTurn.isConnected)_resetLogGroups();
+  const currentSec=_tsSeconds(e.ts),lastSec=+(_activeTurn?.dataset.lastSec||0);
+  let gap=currentSec&&lastSec?Math.abs(currentSec-lastSec):0;
+  if(gap>43200)gap=86400-gap;
+  const startsNext=_activeTurn&&_activeTurn.dataset.hasReply==="1"&&
+    (e.k==="think"||(e.k==="tool"&&gap>15));
+  const turn=(!_activeTurn||startsNext)?_newTurn(logEl,e,first):_activeTurn;
+  if(currentSec)turn.dataset.lastSec=String(currentSec);
+  return turn;
+}
+function _ensureTrace(turn){
+  if(_activeTrace&&_activeTrace.isConnected)return _activeTrace;
+  const trace=document.createElement("details");
+  trace.className="run-trace";
+  trace.dataset.count="0";
+  const summary=document.createElement("summary");
+  const title=document.createElement("span");
+  title.textContent="执行轨迹";
+  const meta=document.createElement("span");
+  meta.className="trace-meta";meta.textContent="0 步 · 点击展开";
+  summary.append(title,meta);
+  const body=document.createElement("div");
+  body.className="trace-body";
+  trace.append(summary,body);
+  turn.querySelector(".turn-body").appendChild(trace);
+  _activeTrace=trace;_lastTraceStep=null;
+  return trace;
+}
+function _addTraceStep(trace,text,kind){
+  const body=trace.querySelector(".trace-body");
+  const step=document.createElement("div");
+  step.className="trace-step"+(kind==="think"?" trace-thinking":"");
+  if(kind==="think"){
+    step.textContent=text;
   }else{
-    d.className=base;d.textContent=e.t||"";
+    const main=document.createElement("div");
+    main.className="trace-main";
+    const icon=document.createElement("span");
+    icon.className="trace-icon";icon.textContent="↳";
+    const label=document.createElement("span");
+    label.textContent=text;
+    main.append(icon,label);step.appendChild(main);
   }
-  return d;
+  body.appendChild(step);
+  const count=(+trace.dataset.count||0)+1;
+  trace.dataset.count=String(count);
+  trace.querySelector(".trace-meta").textContent=count+" 步 · 点击展开";
+  _lastTraceStep=step;
+  return step;
+}
+function _renderClaudeEvt(jsonStr,first,logEl){
+  let e;try{e=JSON.parse(jsonStr);}catch(err){return false;}
+  if(_evtFresh(e.ts))_liveOnEvt(e.k);
+  const turn=_turnForEvent(logEl,e,first);
+  const text=String(e.t||"");
+  _systemTrace=null;
+  if(e.k==="think"){
+    _addTraceStep(_ensureTrace(turn),text,"think");
+  }else if(e.k==="tool"){
+    _addTraceStep(_ensureTrace(turn),text,"tool");
+  }else if(e.k==="result"){
+    const trace=_ensureTrace(turn);
+    const step=(_lastTraceStep&&_lastTraceStep.isConnected)
+      ?_lastTraceStep:_addTraceStep(trace,"运行结果","tool");
+    let result=step.querySelector(".trace-result");
+    if(!result){
+      result=document.createElement("div");result.className="trace-result";
+      step.appendChild(result);
+    }
+    result.textContent+=(result.textContent?"\n":"")+text;
+  }else if(e.k==="text"){
+    const reply=document.createElement("div");
+    reply.className="cl-text";reply.textContent=text;
+    turn.querySelector(".turn-body").appendChild(reply);
+    turn.dataset.hasReply="1";
+    _activeTrace=null;_lastTraceStep=null;
+  }else{
+    _addTraceStep(_ensureTrace(turn),text||e.k,"tool");
+  }
+  return true;
+}
+
+function _appendSystemLog(logEl,text,first){
+  if(!_systemTrace||!_systemTrace.isConnected){
+    const trace=document.createElement("details");
+    trace.className="system-trace"+(first?"":" new");
+    trace.dataset.count="0";
+    const summary=document.createElement("summary");
+    const title=document.createElement("span");title.textContent="运行记录";
+    const meta=document.createElement("span");meta.className="trace-meta";
+    summary.append(title,meta);
+    const body=document.createElement("div");body.className="system-body";
+    trace.append(summary,body);logEl.appendChild(trace);
+    _systemTrace=trace;
+  }
+  const body=_systemTrace.querySelector(".system-body");
+  const line=document.createElement("div");
+  const alert=/error|failed|exception|traceback|\b[45]\d\d\b/i.test(text);
+  line.className="system-line"+(alert?" alert":"");
+  line.textContent=text;body.appendChild(line);
+  while(body.children.length>100)body.removeChild(body.firstChild);
+  const count=(+_systemTrace.dataset.count||0)+1;
+  _systemTrace.dataset.count=String(count);
+  _systemTrace.querySelector(".trace-meta").textContent=count+" 条 · 点击展开";
+  if(alert)_systemTrace.open=true;
 }
 
 // ── Claude 思考动效：pending 期间在日志底部显示动态指示器（仿桌面端）──
@@ -2175,20 +2591,12 @@ function _appendLog(text,first){
   const logEl=document.getElementById("log-output");
   if(paused)return;
   const atBottom=(logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight)<40;
-  let div;
   if(text.startsWith("@@CLAUDE@@")){
-    div=_renderClaudeEvt(text.slice(10),first);
-    if(!div)return;
+    if(!_renderClaudeEvt(text.slice(10),first,logEl))return;
   }else{
-    div=document.createElement("div");
-    const isClaude=text.includes("] [Claude] ")||text.startsWith("                    ");
-    div.className="ll"+(first?"":" new")+(isClaude?" claude":"");
-    div.textContent=text;
+    _appendSystemLog(logEl,text,first);
   }
-  div.style.opacity="0";div.style.transition="opacity .5s ease";
-  logEl.appendChild(div);
-  requestAnimationFrame(()=>requestAnimationFrame(()=>div.style.opacity="1"));
-  while(logEl.children.length>500){
+  while(logEl.children.length>120){
     const removed=logEl.firstChild;
     const h=removed.offsetHeight;
     logEl.removeChild(removed);
@@ -2316,7 +2724,10 @@ function togglePause(){
   paused=!paused;
   document.getElementById("pauseBtn").textContent=paused?"▶ 继续":"⏸ 暂停";
 }
-function clearLog(){document.getElementById("log-output").innerHTML="";}
+function clearLog(){
+  document.getElementById("log-output").replaceChildren();
+  _resetLogGroups();
+}
 function toast(msg){
   const t=document.getElementById("toast");
   t.textContent=msg;t.classList.add("show");
@@ -2557,7 +2968,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if since > 0:
                 lines = [text for seq, text in buf if seq > since]
             else:
-                lines = [text for _, text in buf[-200:]]
+                lines = [text for _, text in list(buf)[-200:]]
         for line in lines:
             try:
                 self.wfile.write(f"data: {line}\n\n".encode())
@@ -2609,7 +3020,7 @@ def main():
     # 结构化 Claude 实时输出：tail transcript JSONL（思考/输出/工具分离）
     # 取代旧的 tmux 抓屏（_tmux_capture_loop 保留备用，不再默认启动）
     threading.Thread(target=_transcript_tail_loop, daemon=True).start()
-    print(f"Dashboard → http://localhost:{DASHBOARD_PORT}")
+    print(f"AI Bridge 3.0 Dashboard → http://localhost:{DASHBOARD_PORT}")
     print(f"Bridge script: {BRIDGE_SCRIPT}")
     try:
         ThreadingDashboard(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever()

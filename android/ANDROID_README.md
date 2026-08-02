@@ -1,20 +1,20 @@
-# Claude Bridge — 安卓 App 使用说明
+# AI Bridge 3.0 — 安卓 App 使用说明
 
 太子手搓的 Android WebView App，**只是手机端的"遥控器"**——电脑上的 bridge / dashboard 服务必须开着，APK 只是把控制面板套个壳搬到手机上。
 
 ## 安装
 
-1. 拿到 `ClaudeBridge.apk`（在 `D:\AI\claudecode-telegram-main\dist\` 里）
+1. 拿到 `AI Bridge 3.0.apk`（在 `D:\AI\claudecode-telegram-main\dist\` 里）
 2. 用 QQ / 微信 / U盘 / 数据线传到手机
 3. 手机点开 APK，允许"未知来源安装"
-4. 装好后桌面图标叫 **Claude Bridge**
+4. 装好后桌面图标叫 **AI Bridge 3.0**
 
 > 首次安装如果被拦：设置 → 安全 → 允许此来源安装应用
 
 ## 首次使用
 
-1. **电脑这边先把控制面板跑起来**：双击桌面的 `Claude Bridge2.1.exe`，或者跑 `start.sh`
-2. **手机打开 Claude Bridge**，会跳到设置页让你填地址，两种选一种：
+1. **电脑这边先把控制面板跑起来**：双击桌面的 `AI Bridge 3.0.exe`，或者跑 `start.sh`
+2. **手机打开 AI Bridge 3.0**，会跳到设置页让你填地址，两种选一种：
 
 ### A. 局域网（手机和电脑同 WiFi，最快）
 
