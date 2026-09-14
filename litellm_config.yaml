@@ -1,82 +1,73 @@
 model_list:
-  # --- 原始模型名（直接API调用时使用） ---
+  # 凭据只从环境变量读取，禁止在仓库中写入真实 API Key。
   - model_name: deepseek-chat
     litellm_params:
       model: deepseek/deepseek-chat
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/DEEPSEEK_API_KEY
 
   - model_name: deepseek-reasoner
     litellm_params:
       model: deepseek/deepseek-reasoner
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/DEEPSEEK_API_KEY
 
   - model_name: glm-4-plus
     litellm_params:
       model: openai/glm-4-plus
       api_base: https://open.bigmodel.cn/api/paas/v4
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/ZHIPU_API_KEY
 
   - model_name: glm-4-flash
     litellm_params:
       model: openai/glm-4-flash
       api_base: https://open.bigmodel.cn/api/paas/v4
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/ZHIPU_API_KEY
 
   - model_name: qwen-max
     litellm_params:
       model: openai/qwen-max
       api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/BAILIAN_API_KEY
 
   - model_name: qwen-plus
     litellm_params:
       model: openai/qwen-plus
       api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/BAILIAN_API_KEY
 
-  # --- Claude 伪装别名（供 Claude Code CLI 通过 LiteLLM 使用） ---
-  # bridge.py CLI_MODEL_ALIAS 映射: 真实模型 → Claude别名
-  # 每个非Claude模型有唯一别名，避免LiteLLM负载均衡混淆
-
-  # deepseek-chat → claude-3-5-sonnet-20241022
+  # Claude 别名供 CLI 兼容层使用；各别名仍读取对应厂商环境变量。
   - model_name: claude-3-5-sonnet-20241022
     litellm_params:
       model: deepseek/deepseek-chat
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/DEEPSEEK_API_KEY
 
-  # deepseek-reasoner → claude-3-opus-20240229
   - model_name: claude-3-opus-20240229
     litellm_params:
       model: deepseek/deepseek-reasoner
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/DEEPSEEK_API_KEY
 
-  # glm-4-plus → claude-3-sonnet-20240229
   - model_name: claude-3-sonnet-20240229
     litellm_params:
       model: openai/glm-4-plus
       api_base: https://open.bigmodel.cn/api/paas/v4
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/ZHIPU_API_KEY
 
-  # glm-4-flash → claude-3-haiku-20240307
   - model_name: claude-3-haiku-20240307
     litellm_params:
       model: openai/glm-4-flash
       api_base: https://open.bigmodel.cn/api/paas/v4
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/ZHIPU_API_KEY
 
-  # qwen-max → claude-3-5-sonnet-latest
   - model_name: claude-3-5-sonnet-latest
     litellm_params:
       model: openai/qwen-max
       api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/BAILIAN_API_KEY
 
-  # qwen-plus → claude-3-opus-latest
   - model_name: claude-3-opus-latest
     litellm_params:
       model: openai/qwen-plus
       api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
-      api_key: REDACTED_API_KEY
+      api_key: os.environ/BAILIAN_API_KEY
 
 litellm_settings:
   drop_params: true

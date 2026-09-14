@@ -1135,8 +1135,10 @@ def get_api_keys():
 
 
 def save_api_keys(keys):
-    with open(API_KEYS_FILE, "w") as f:
+    fd = os.open(API_KEYS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(keys, f, indent=2)
+    os.chmod(API_KEYS_FILE, 0o600)
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────

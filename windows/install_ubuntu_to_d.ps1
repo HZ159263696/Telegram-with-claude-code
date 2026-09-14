@@ -3,7 +3,7 @@
 
 param(
     [string]$InstallPath = "D:\WSL\Ubuntu",
-    [string]$Username = "hz"
+    [string]$Username = "codex"
 )
 
 # Check admin

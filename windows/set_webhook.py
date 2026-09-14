@@ -10,7 +10,6 @@ if not webhook_url:
     print("Usage: set_webhook.py <url>")
     raise SystemExit(1)
 
-print(f"Token : {token[:10]}...")
 print(f"URL   : {webhook_url}")
 
 data = urllib.parse.urlencode({"url": webhook_url}).encode()

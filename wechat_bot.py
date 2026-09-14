@@ -19,10 +19,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
-TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN",
-           open(Path.home()/".claude/hooks/send-to-telegram.py").read()
-           .split('TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "')[1].split('"')[0]
-           if (Path.home()/".claude/hooks/send-to-telegram.py").exists() else "")
+TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID  = (Path.home()/".claude/telegram_chat_id").read_text().strip() \
            if (Path.home()/".claude/telegram_chat_id").exists() else ""
 SESSION_DIR = Path.home() / ".claude" / "wechat_session"

@@ -21,7 +21,7 @@ except Exception:
 LOG = "/tmp/hook_debug.log"
 TOKEN_STATS_FILE = os.path.expanduser("~/.claude/telegram_token_stats.json")
 
-FEISHU_APP_ID     = os.environ.get("FEISHU_APP_ID",     "REDACTED_FEISHU_APP_ID")
+FEISHU_APP_ID     = os.environ.get("FEISHU_APP_ID",     "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 FEISHU_STOCK_CONFIG = os.environ.get(
     "FEISHU_STOCK_CONFIG",
@@ -59,7 +59,7 @@ BOT_ROUTES = [
     {
         "bot":     "stock",
         "workdir": "/mnt/d/cao_stock",
-        "token":   os.environ.get("STOCK_BOT_TOKEN", "REDACTED_TELEGRAM_TOKEN"),
+        "token":   os.environ.get("STOCK_BOT_TOKEN", ""),
         "pending": os.path.expanduser("~/.claude/telegram_pending_stock"),
         "target":  os.path.expanduser("~/.claude/telegram_chat_id_stock"),
     },
@@ -86,7 +86,7 @@ BOT_ROUTES = [
     {   # 主控Bot（兜底，workdir 空 = 匹配所有其它路径）
         "bot":     "main",
         "workdir": "",
-        "token":   os.environ.get("TELEGRAM_BOT_TOKEN", "REDACTED_TELEGRAM_TOKEN"),
+        "token":   os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "pending": os.path.expanduser("~/.claude/telegram_pending"),
         "target":  os.path.expanduser("~/.claude/telegram_chat_id"),
     },

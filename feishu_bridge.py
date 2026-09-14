@@ -47,7 +47,7 @@ def _load_env_file(path: str) -> dict[str, str]:
 FEISHU_CONFIG_FILE = os.environ.get("FEISHU_CONFIG_FILE", "")
 _file_config = _load_env_file(FEISHU_CONFIG_FILE)
 APP_ID = os.environ.get("FEISHU_APP_ID") or _file_config.get(
-    "FEISHU_APP_ID", "REDACTED_FEISHU_APP_ID")
+    "FEISHU_APP_ID", "")
 APP_SECRET = os.environ.get("FEISHU_APP_SECRET") or _file_config.get(
     "FEISHU_APP_SECRET", "")
 MAX_REPLY_LEN = 28000

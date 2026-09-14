@@ -58,7 +58,7 @@ CODEX_EXECUTABLE = os.environ.get(
     _USER_CODEX_EXECUTABLE if os.path.isfile(_USER_CODEX_EXECUTABLE) else "codex",
 )
 
-FEISHU_APP_ID     = os.environ.get("FEISHU_APP_ID",     "REDACTED_FEISHU_APP_ID")
+FEISHU_APP_ID     = os.environ.get("FEISHU_APP_ID",     "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 
 # ── 主动支持的 Bot ────────────────────────────────────────────────────────────
@@ -67,14 +67,14 @@ BOTS = {
     "main": {
         "mem_bot":      "main",
         "kind":         "telegram",
-        "token":        os.environ.get("TELEGRAM_BOT_TOKEN", "REDACTED_TELEGRAM_TOKEN"),
+        "token":        os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         "chat_id_file": os.path.expanduser("~/.claude/telegram_chat_id"),
         "pending_file": os.path.expanduser("~/.claude/telegram_pending"),
     },
     "stock": {
         "mem_bot":      "stock",
         "kind":         "telegram",
-        "token":        os.environ.get("STOCK_BOT_TOKEN", "REDACTED_TELEGRAM_TOKEN"),
+        "token":        os.environ.get("STOCK_BOT_TOKEN", ""),
         "chat_id_file": os.path.expanduser("~/.claude/telegram_chat_id_stock"),
         "pending_file": os.path.expanduser("~/.claude/telegram_pending_stock"),
     },

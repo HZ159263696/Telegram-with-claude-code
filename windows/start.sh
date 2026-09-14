@@ -22,6 +22,9 @@ PROJECT="/mnt/d/AI/claudecode-telegram-main"
 FEISHU_STOCK_CONFIG="$PROJECT/.env.feishu_stock"
 PORT=9999
 
+# 本地凭据文件不得对其他系统用户可读。
+chmod 600 "$HOME/.claude/telegram_api_keys.json" "$FEISHU_STOCK_CONFIG" 2>/dev/null || true
+
 if [ -z "$TOKEN" ]; then
     echo "ERROR: TELEGRAM_BOT_TOKEN not set"
     exit 1
@@ -80,7 +83,11 @@ if [ -n "$TMUX" ]; then
     pkill -f "litellm" 2>/dev/null; sleep 0.5
     LITELLM_CONFIG="$PROJECT/litellm_config.yaml"
     if command -v litellm &>/dev/null; then
-        nohup litellm --config "$LITELLM_CONFIG" --port 4000 > /tmp/litellm.log 2>&1 </dev/null &
+        DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-$(python3 -c 'import json,os; p=os.path.expanduser("~/.claude/telegram_api_keys.json"); print(json.load(open(p)).get("deepseek", "")) if os.path.exists(p) else None' 2>/dev/null)}"
+        ZHIPU_API_KEY="${ZHIPU_API_KEY:-$(python3 -c 'import json,os; p=os.path.expanduser("~/.claude/telegram_api_keys.json"); print(json.load(open(p)).get("zhipu", "")) if os.path.exists(p) else None' 2>/dev/null)}"
+        BAILIAN_API_KEY="${BAILIAN_API_KEY:-$(python3 -c 'import json,os; p=os.path.expanduser("~/.claude/telegram_api_keys.json"); print(json.load(open(p)).get("bailian", "")) if os.path.exists(p) else None' 2>/dev/null)}"
+        nohup env DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" ZHIPU_API_KEY="$ZHIPU_API_KEY" BAILIAN_API_KEY="$BAILIAN_API_KEY" \
+            litellm --config "$LITELLM_CONFIG" --port 4000 > /tmp/litellm.log 2>&1 </dev/null &
         disown
         sleep 2
         echo "    LiteLLM proxy started (log: /tmp/litellm.log)"

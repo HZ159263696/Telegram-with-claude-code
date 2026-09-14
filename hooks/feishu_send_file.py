@@ -36,7 +36,7 @@ def _load_env_file(path):
 
 _config = _load_env_file(os.environ.get("FEISHU_CONFIG_FILE", ""))
 APP_ID = os.environ.get("FEISHU_APP_ID") or _config.get(
-    "FEISHU_APP_ID", "REDACTED_FEISHU_APP_ID")
+    "FEISHU_APP_ID", "")
 APP_SECRET = os.environ.get("FEISHU_APP_SECRET") or _config.get(
     "FEISHU_APP_SECRET", "")
 CHAT_ID_FILE = os.path.expanduser(os.environ.get(

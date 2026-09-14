@@ -9,7 +9,7 @@
 | 项目 | 内容 |
 |------|------|
 | WSL 发行版 | Ubuntu 22.04 LTS，安装在 `D:\WSL\Ubuntu` |
-| WSL 用户名 | `hz` |
+| WSL 用户名 | `<user>` |
 | Claude Code | 已安装 |
 | Stop 钩子 | `/home/<user>/.claude/hooks/send-to-telegram.sh` |
 | Bot Token | 已保存到 `/etc/claude_env.sh` 和 `~/.profile` |
