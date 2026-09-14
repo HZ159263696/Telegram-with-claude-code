@@ -11,7 +11,7 @@
 | WSL 发行版 | Ubuntu 22.04 LTS，安装在 `D:\WSL\Ubuntu` |
 | WSL 用户名 | `<user>` |
 | Claude Code | 已安装 |
-| Stop 钩子 | `/home/<user>/.claude/hooks/send-to-telegram.sh` |
+| Stop 钩子 | `/home/<user>/.claude/hooks/send-to-telegram.py` |
 | Bot Token | 已保存到 `/etc/claude_env.sh` 和 `~/.profile` |
 
 ---
@@ -26,12 +26,12 @@ wsl -d Ubuntu -- bash /mnt/d/AI/claudecode-telegram-main/windows/start.sh
 
 启动后会自动完成：
 1. 创建名为 `bridge` 的 tmux 会话
-2. 在 `bridge` 会话内新开 `claude` 窗口并运行 Claude Code
-3. 启动 localtunnel 公网 HTTPS 隧道
+2. 启动各 Bot 对应的 Claude/Codex 会话
+3. 启动 ngrok 或 localtunnel 公网 HTTPS 隧道
 4. 自动向 Telegram 注册 Webhook
-5. 启动桥接服务器（监听 8080 端口，自动重启）
+5. 启动桥接服务器（监听 9999 端口，自动重启）
 
-看到 `Bridge on :8080` 后即可在 Telegram 里发消息给 Bot。
+看到 `Bridge on :9999` 后即可在 Telegram 里发消息给 Bot。
 
 ---
 
@@ -98,7 +98,7 @@ cat ~/.claude/telegram_chat_id # 当前绑定的 Telegram Chat ID
 ```
 你在 Telegram 发消息（文字或图片）
     ↓
-localtunnel 转发到本地 8080 端口
+ngrok/localtunnel 转发到本地 9999 端口
     ↓
 bridge.py 收到 webhook
     ↓
@@ -106,7 +106,7 @@ tmux send-keys 注入文字到 Claude Code（claude 窗口）
     ↓
 Claude 执行完毕，触发 Stop 钩子
     ↓
-send-to-telegram.sh 读取回复，发回 Telegram
+send-to-telegram.py 读取回复，发回 Telegram/飞书
 ```
 
 ---

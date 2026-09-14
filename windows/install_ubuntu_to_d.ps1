@@ -84,5 +84,5 @@ Write-Host "Ubuntu installed at: $InstallPath" -ForegroundColor Green
 Write-Host "Username: $Username" -ForegroundColor Green
 Write-Host ""
 Write-Host "Test it: wsl -d Ubuntu" -ForegroundColor Yellow
-Write-Host "Next:    Run windows\2_setup_env.ps1" -ForegroundColor Yellow
+Write-Host "Next:    Run setup_deps.sh in WSL, then windows\start.sh" -ForegroundColor Yellow
 Read-Host "Press Enter to exit"
