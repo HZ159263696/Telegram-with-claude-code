@@ -1,122 +1,162 @@
-# Windows 使用说明
+# AI Bridge 3.0
 
-通过 Telegram 远程操控运行在 WSL2（Ubuntu）里的 Claude Code。
+在 Windows + WSL2 环境中，将 Telegram、飞书与 Claude Code / Codex CLI 连接起来的本地桥接系统。它支持多 Bot 隔离、模型切换、文件与图片处理、语音转写，以及浏览器控制面板。
 
----
+> 本项目允许聊天消息触发本机 AI CLI 执行命令。请仅绑定可信账号，不要把管理入口或 Bot Token 分享给他人。
 
-## 环境信息（已安装完成）
+## 主要功能
 
-| 项目 | 内容 |
-|------|------|
-| WSL 发行版 | Ubuntu 22.04 LTS，安装在 `D:\WSL\Ubuntu` |
-| WSL 用户名 | `<user>` |
-| Claude Code | 已安装 |
-| Stop 钩子 | `/home/<user>/.claude/hooks/send-to-telegram.py` |
-| Bot Token | 已保存到 `/etc/claude_env.sh` 和 `~/.profile` |
+- Telegram 与飞书双向消息转发
+- Claude Code 常驻 tmux 会话
+- Codex CLI 登录态调用与会话续接
+- Claude、Codex、DeepSeek、智谱和百炼模型切换
+- 文字、图片、文件及 Telegram 语音消息处理
+- 多 Bot 独立会话、模型、思考档位和回复状态
+- Dashboard 服务管理、实时日志、Token 统计和模型配置
+- Webhook Secret 校验、回复去重、失败补发及超时保护
+- 可选 Windows 桌面端与 Android WebView 客户端
 
----
+## 架构
 
-## 每次启动（日常使用）
+```text
+Telegram ── HTTPS Webhook ─┐
+                           ├─> bridge.py ─> Claude Code / Codex CLI
+飞书 ── WebSocket ─────────┘        │
+                                    ├─> hooks/send-to-telegram.py
+浏览器 / Android ─> dashboard.py ──┘
+```
 
-打开 PowerShell，运行：
+核心桥接逻辑使用 Python 标准库。飞书、LiteLLM、语音转写及桌面/Android 客户端按需安装依赖。
+
+## 环境要求
+
+- Windows 10/11 与 WSL2 Ubuntu
+- Python 3.10+
+- tmux、curl、jq、ffmpeg
+- Node.js 22 与 Claude Code
+- Codex CLI（使用 Codex 模型时）
+- ngrok（Telegram Webhook）
+- 可选：LiteLLM、`lark-oapi`、Whisper、PyQt6、Android SDK
+
+## 安装
+
+项目启动脚本默认路径为：
+
+```text
+D:\AI\claudecode-telegram-main
+/mnt/d/AI/claudecode-telegram-main
+```
+
+克隆到其他目录时，请同步修改启动脚本中的 `PROJECT` 路径。
+
+在 WSL 中安装基础依赖：
+
+```bash
+cd /mnt/d/AI/claudecode-telegram-main
+bash windows/setup_deps.sh
+```
+
+根据需要安装可选组件：
+
+```bash
+python3 -m pip install --user 'litellm[proxy]' lark-oapi
+```
+
+首次使用 Claude Code 或 Codex：
+
+```bash
+claude  # 首次运行时按提示完成登录
+codex login
+```
+
+## 配置
+
+凭据只能保存在环境变量或已被 `.gitignore` 排除的本地配置中，不要写进源码。
+
+| 变量 | 用途 | 默认值 |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | Telegram 主 Bot Token | 必填 |
+| `STOCK_BOT_TOKEN` | 第二个 Telegram Bot | 可选 |
+| `FEISHU_APP_ID` | 飞书应用 ID | 可选 |
+| `FEISHU_APP_SECRET` | 飞书应用密钥 | 可选 |
+| `DEEPSEEK_API_KEY` | DeepSeek API Key | 可选 |
+| `ZHIPU_API_KEY` | 智谱 API Key | 可选 |
+| `BAILIAN_API_KEY` | 阿里百炼 API Key | 可选 |
+| `CODEX_EXECUTABLE` | Codex CLI 路径 | 自动检测 |
+| `CODEX_TIMEOUT` | Codex 单轮超时秒数 | `1800` |
+| `PORT` | Bridge 端口 | `9999` |
+| `DASHBOARD_PORT` | Dashboard 端口 | `8888` |
+
+示例：
+
+```bash
+export TELEGRAM_BOT_TOKEN='replace-with-your-token'
+export STOCK_BOT_TOKEN='replace-with-your-second-token'
+```
+
+Dashboard 保存的模型 API Key 位于 `~/.claude/telegram_api_keys.json`，启动脚本会将权限收紧为仅当前用户可读写。
+
+## 启动
+
+从 Windows PowerShell 执行：
 
 ```powershell
 wsl -d Ubuntu -- bash /mnt/d/AI/claudecode-telegram-main/windows/start.sh
 ```
 
-启动后会自动完成：
-1. 创建名为 `bridge` 的 tmux 会话
-2. 启动各 Bot 对应的 Claude/Codex 会话
-3. 启动 ngrok 或 localtunnel 公网 HTTPS 隧道
-4. 自动向 Telegram 注册 Webhook
-5. 启动桥接服务器（监听 9999 端口，自动重启）
+启动流程包括：
 
-看到 `Bridge on :9999` 后即可在 Telegram 里发消息给 Bot。
+1. 部署当前 Python 回复 Hook。
+2. 创建各 Bot 的 tmux 会话。
+3. 启动模型兼容代理和可选飞书桥。
+4. 启动 ngrok 并注册带 Secret 的 Telegram Webhook。
+5. 启动 Dashboard 和 Bridge。
 
----
+本地入口：
 
-## Telegram Bot 命令
+- Dashboard：`http://127.0.0.1:8888`
+- Bridge 健康检查：`http://127.0.0.1:9999/health`
 
-| 命令 | 功能 |
-|------|------|
-| 直接发文字 | 将消息发送给 Claude Code 执行 |
-| 直接发图片 | 图片下载到本地后将路径发给 Claude |
-| `/status` | 查看 tmux 会话状态 |
-| `/stop` | 中断当前 Claude 任务（发送 Escape） |
-| `/clear` | 清空当前对话 |
-| `/continue_` | 继续最近一次会话 |
-| `/resume` | 显示历史会话列表，选择恢复 |
-| `/loop <提示词>` | 启动 Ralph Loop（最多 5 次迭代） |
-| `/model` | 切换 Claude 模型（Opus / Sonnet / Haiku） |
-| `/restart` | 重启桥接服务器 bridge.py |
+查看后台会话：
 
----
-
-## 常用维护命令
-
-**进入 WSL Ubuntu 终端：**
 ```powershell
-wsl -d Ubuntu
-tmux attach -t bridge 进入关闭bridge
+wsl -d Ubuntu -- tmux attach -t bridge
 ```
 
-**查看/接管桥接服务器的终端窗口：**
-```bash
-tmux attach -t bridge
-# 退出但不关闭：按 Ctrl+B，然后按 D
-```
+按 `Ctrl+B`，再按 `D`，可退出 tmux 而不停止服务。
 
-**在 bridge 会话内切换到 Claude Code 窗口：**
-```bash
-# 接管后按 Ctrl+B，再按数字 1（或用方向键选窗口）
-# 窗口 0 = bridge 服务，窗口 1 = claude
-```
+## 目录说明
 
-**手动启动 Claude Code 窗口（如果丢失）：**
-```bash
-tmux new-window -t bridge -n claude "claude --dangerously-skip-permissions"
-```
-
-**更新 Bot Token：**
-```bash
-# 在 WSL 里编辑
-sudo nano /etc/claude_env.sh
-# 找到 TELEGRAM_BOT_TOKEN 那行，修改后保存
-source /etc/claude_env.sh
-```
-
-**查看 Stop 钩子状态（调试用）：**
-```bash
-ls ~/.claude/telegram_pending  # 存在时说明正在等待响应
-cat ~/.claude/telegram_chat_id # 当前绑定的 Telegram Chat ID
-```
-
----
-
-## 工作原理
-
-```
-你在 Telegram 发消息（文字或图片）
-    ↓
-ngrok/localtunnel 转发到本地 9999 端口
-    ↓
-bridge.py 收到 webhook
-    ↓
-tmux send-keys 注入文字到 Claude Code（claude 窗口）
-    ↓
-Claude 执行完毕，触发 Stop 钩子
-    ↓
-send-to-telegram.py 读取回复，发回 Telegram/飞书
-```
-
----
-
-## 路径速查
-
-| Windows 路径 | WSL 路径 |
+| 路径 | 说明 |
 |---|---|
-| `D:\AI\claudecode-telegram-main` | `/mnt/d/AI/claudecode-telegram-main` |
-| `D:\WSL\Ubuntu` | Ubuntu 系统文件 |
-| `C:\Users\<user>\` | `/mnt/c/Users/<user>/` |
-| WSL 用户目录 | `/home/<user>/` |
-| Claude 配置 | `/home/<user>/.claude/` |
+| `bridge.py` | Telegram Webhook、消息路由和 Codex 调用 |
+| `dashboard.py` | Web 控制面板与服务管理 |
+| `feishu_bridge.py` | 飞书长连接桥接 |
+| `anthropic_proxy.py` | Anthropic 与 OpenAI 格式转换 |
+| `proactive.py` | 主动任务与 Bot 记忆调度 |
+| `hooks/` | 回复发送、文件发送及记忆 Hook |
+| `windows/start.sh` | WSL 一键启动入口 |
+| `windows/deploy_hook.sh` | 部署当前 Hook |
+| `android/` | Android 控制端源码 |
+
+## 构建客户端
+
+Windows 桌面端：
+
+```powershell
+build30.bat
+```
+
+构建输出位于本地 `dist/`，不会提交到 Git。Android 客户端说明见 [`android/ANDROID_README.md`](android/ANDROID_README.md)。
+
+## 安全建议
+
+- 首次部署前修改源码中的 Telegram Chat ID 白名单。
+- 不要提交 `.env*`、证书、Token、API Key、聊天记录或本机配置。
+- Dashboard 具备管理能力，建议仅通过可信网络访问。
+- 一旦凭据进入 Git 历史，应立即轮换凭据；删除文件或强推不能撤销已经发生的泄露。
+- 定期检查 Git 历史、Actions 日志和发布附件中的敏感信息。
+
+## 许可证
+
+当前仓库未附带开源许可证。公开可见不代表自动授权复制、修改或分发；如需开放使用，请添加合适的 `LICENSE`。
